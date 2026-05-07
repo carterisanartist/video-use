@@ -59,7 +59,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, optional Whisper backend config). Don't re-run it every session; on cold start just verify:
 
-- The Whisper backend works. The default (`faster-whisper`) needs no API key — just `python -c "from faster_whisper import WhisperModel"` should import cleanly. If you'll use the hosted backend, check `OPENAI_API_KEY` is set.
+- The Whisper backend works. On Linux / Windows / Intel Mac the default `faster-whisper` needs no API key — `python -c "from faster_whisper import WhisperModel"` should import cleanly. On Apple Silicon (M1/M2/M3/M4), the smart default switches to `mlx-whisper` once `pip install -e '.[mac]'` has been run; verify with `python -c "import mlx_whisper"`. If you'll use the hosted backend, check `OPENAI_API_KEY` is set.
 - If the user wants speaker diarization, `HUGGINGFACE_TOKEN` resolves (in env or in `.env` at the repo root) and `pyannote.audio` is importable. If missing, diarization is silently skipped and every word gets `speaker_0` — call this out in the inventory phase if the take is multi-speaker.
 - `ffmpeg` + `ffprobe` on PATH.
 - Python deps installed (`uv sync` or `pip install -e .` inside the repo).
@@ -72,8 +72,8 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
-- **`transcribe.py <video>`** — single-file Whisper call. Default backend is local `faster-whisper`; switch with `--backend openai|whisper`. `--num-speakers N` is a hint to pyannote when diarization is enabled. `--no-diarize` skips diarization entirely. Cached.
-- **`transcribe_batch.py <videos_dir>`** — parallel batch transcription. Default workers: 1 for local backends (model lives in RAM/VRAM per worker), 4 for the hosted `openai` backend.
+- **`transcribe.py <video>`** — single-file Whisper call. Smart default backend: `mlx` on Apple Silicon when `mlx-whisper` is installed, otherwise `faster-whisper`. Override with `--backend faster-whisper|mlx|openai|whisper`. `--num-speakers N` is a hint to pyannote when diarization is enabled. `--no-diarize` skips diarization entirely. `--device mps` is valid for the `whisper` backend on Apple Silicon. Cached.
+- **`transcribe_batch.py <videos_dir>`** — parallel batch transcription. Default workers: 1 for local backends (model lives in RAM / VRAM / Apple GPU per worker), 4 for the hosted `openai` backend.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
@@ -317,6 +317,7 @@ Things that consistently fail regardless of style:
 - **Whisper SRT / phrase-level output.** Loses sub-second gap data. Always word-level verbatim (`word_timestamps=True`).
 - **Tiny / base Whisper models for the final cut.** They miss filler words (which you want as editorial signal) and hallucinate proper nouns. Use `large-v3` for anything you'll ship; `tiny` is only for install smoke tests. `medium` is the reasonable speed/quality tradeoff on CPU.
 - **CPU + `large-v3` for long sessions without expectations set.** Plan for ~1× realtime on a modern CPU, much faster on a CUDA GPU. Drop to `medium` or switch to `--backend openai` if the user is impatient.
+- **`faster-whisper` on Apple Silicon when `mlx-whisper` is available.** CTranslate2 has no Metal backend; you'll be running on the CPU only. The auto-pick handles this if `[mac]` was installed; if you forced `--backend faster-whisper` on a Mac, undo it.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.

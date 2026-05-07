@@ -1,6 +1,11 @@
-"""Transcribe a video with Whisper (local faster-whisper, OpenAI cloud, or
-the reference openai-whisper package). Optional speaker diarization via
-pyannote.audio.
+"""Transcribe a video with Whisper. Four backends are supported:
+
+  - faster-whisper  (default on Linux / Windows / Intel Mac)
+  - mlx             (default on Apple Silicon when mlx-whisper is installed)
+  - openai          (hosted whisper-1 API)
+  - whisper         (the reference openai-whisper package; can use MPS on Mac)
+
+Optional speaker diarization via pyannote.audio (CUDA / MPS / CPU).
 
 Output is a single JSON file at <edit_dir>/transcripts/<video_stem>.json
 matching the schema the rest of the video-use pipeline expects:
@@ -32,8 +37,9 @@ Usage:
     python helpers/transcribe.py <video_path> --language en
     python helpers/transcribe.py <video_path> --num-speakers 2
     python helpers/transcribe.py <video_path> --backend faster-whisper --model large-v3
+    python helpers/transcribe.py <video_path> --backend mlx --model mlx-community/whisper-large-v3-mlx
     python helpers/transcribe.py <video_path> --backend openai
-    python helpers/transcribe.py <video_path> --backend whisper --model medium
+    python helpers/transcribe.py <video_path> --backend whisper --model medium --device mps
     python helpers/transcribe.py <video_path> --no-diarize
     python helpers/transcribe.py <video_path> --device cuda --compute-type float16
 """
@@ -66,6 +72,9 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_BACKEND = "faster-whisper"
 DEFAULT_MODEL = {
     "faster-whisper": "large-v3",
+    # mlx-whisper resolves model names against HuggingFace; the mlx-community
+    # org maintains pre-converted MLX builds of all Whisper sizes.
+    "mlx": "mlx-community/whisper-large-v3-mlx",
     "openai": "whisper-1",
     "whisper": "large-v3",
 }
@@ -231,13 +240,16 @@ def transcribe_faster_whisper(
         ) from e
 
     if device == "auto":
-        device = _autodetect_device()
+        device = _autodetect_device("faster-whisper")
     if compute_type == "auto":
         compute_type = "float16" if device == "cuda" else "int8"
 
     if verbose:
         print(f"  loading faster-whisper model={model_name} device={device} "
               f"compute_type={compute_type}", flush=True)
+        if _is_apple_silicon() and device == "cpu":
+            print("  hint: on Apple Silicon, --backend mlx is significantly "
+                  "faster than faster-whisper-CPU", flush=True)
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
@@ -274,21 +286,132 @@ def transcribe_faster_whisper(
     return words, meta
 
 
-def _autodetect_device() -> str:
-    """Best-effort CUDA detection for faster-whisper. CPU otherwise."""
+def _is_apple_silicon() -> bool:
+    """True on macOS running on arm64 (M1/M2/M3/M4 and beyond)."""
+    import platform
+    return sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+
+
+def _has_mlx_whisper() -> bool:
     try:
-        import ctranslate2  # type: ignore
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda"
+        import mlx_whisper  # type: ignore  # noqa: F401
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _torch_mps_available() -> bool:
+    try:
+        import torch  # type: ignore
+        return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    except Exception:
+        return False
+
+
+def pick_default_backend() -> str:
+    """Choose the best installed backend automatically.
+
+    On Apple Silicon with mlx-whisper installed → "mlx" (native, fast).
+    Otherwise → "faster-whisper" (the cross-platform default).
+    """
+    if _is_apple_silicon() and _has_mlx_whisper():
+        return "mlx"
+    return DEFAULT_BACKEND
+
+
+def _autodetect_device(backend: str = "faster-whisper") -> str:
+    """Pick the best available device for a given backend.
+
+    - faster-whisper: cuda > cpu (CTranslate2 has no Metal/MPS backend).
+    - openai-whisper / pyannote: cuda > mps > cpu (PyTorch supports MPS).
+    - mlx: irrelevant — MLX always runs on the Apple GPU/ANE.
+    """
     try:
         import torch  # type: ignore
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
         pass
+    if backend == "faster-whisper":
+        try:
+            import ctranslate2  # type: ignore
+            if ctranslate2.get_cuda_device_count() > 0:
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+    if _torch_mps_available():
+        return "mps"
     return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Backend: mlx (Apple MLX framework — native Apple Silicon path)
+# ---------------------------------------------------------------------------
+
+
+def transcribe_mlx_whisper(
+    audio_path: Path,
+    model_name: str,
+    language: str | None,
+    verbose: bool,
+) -> tuple[list[dict], dict]:
+    """Transcribe with mlx-whisper. Apple Silicon only; uses the GPU and
+    Apple Neural Engine via the MLX framework. Roughly 3-5x faster than
+    faster-whisper-CPU on the same Mac for `large-v3`.
+
+    `model_name` is either a HuggingFace repo id (e.g. the default
+    "mlx-community/whisper-large-v3-mlx") or a local path containing the
+    converted MLX weights. Pre-converted models live at:
+    https://huggingface.co/mlx-community
+    """
+    try:
+        import mlx_whisper  # type: ignore
+    except ImportError as e:
+        raise SystemExit(
+            "mlx-whisper is not installed. On Apple Silicon, install with:\n"
+            "    pip install mlx-whisper\n"
+            "or pick a different --backend (faster-whisper / openai / whisper)."
+        ) from e
+    if not _is_apple_silicon():
+        raise SystemExit(
+            "--backend mlx only runs on Apple Silicon (M1/M2/M3/M4). "
+            "On other platforms use faster-whisper, openai, or whisper."
+        )
+
+    if verbose:
+        print(f"  loading mlx-whisper model={model_name}", flush=True)
+        print("  decoding (word-level timestamps via MLX)…", flush=True)
+
+    # mlx-whisper's transcribe API mirrors openai-whisper's. Word timestamps
+    # are produced via the same forced-alignment path.
+    result = mlx_whisper.transcribe(
+        str(audio_path),
+        path_or_hf_repo=model_name,
+        word_timestamps=True,
+        language=language,
+        condition_on_previous_text=False,
+        verbose=None,
+    )
+
+    words: list[dict] = []
+    for seg in result.get("segments", []) or []:
+        for w in seg.get("words", []) or []:
+            text = (w.get("word") or "").strip()
+            if not text:
+                continue
+            words.append({
+                "text": text,
+                "start": float(w["start"]) if w.get("start") is not None else None,
+                "end": float(w["end"]) if w.get("end") is not None else None,
+            })
+
+    meta = {
+        "language": result.get("language"),
+        "language_probability": None,
+        "duration": None,
+    }
+    return words, meta
 
 
 # ---------------------------------------------------------------------------
@@ -375,18 +498,33 @@ def transcribe_openai_whisper(
         ) from e
 
     if device == "auto":
-        device = _autodetect_device()
+        device = _autodetect_device("whisper")
+
+    # openai-whisper's PyTorch path supports MPS on Apple Silicon, but its
+    # forced-alignment kernels need fp32 on MPS — load explicitly in fp32.
+    load_kwargs: dict = {"device": device}
+    if device == "mps":
+        load_kwargs["in_memory"] = True
 
     if verbose:
         print(f"  loading whisper model={model_name} device={device}", flush=True)
 
-    model = whisper.load_model(model_name, device=device)
+    model = whisper.load_model(model_name, **load_kwargs)
+    if device == "mps":
+        try:
+            import torch  # type: ignore
+            model = model.to(torch.float32)
+        except Exception:
+            pass
+
     result = model.transcribe(
         str(audio_path),
         language=language,
         word_timestamps=True,
         verbose=False,
         condition_on_previous_text=False,
+        # MPS does not implement fp16 attention for some kernels — force fp32.
+        fp16=(device == "cuda"),
     )
 
     words: list[dict] = []
@@ -452,15 +590,20 @@ def diarize_pyannote(
               flush=True)
         return None
 
-    # Move to GPU if available.
+    # Move to the best available accelerator. pyannote uses PyTorch under
+    # the hood, so it can take advantage of CUDA on Linux/Windows or MPS on
+    # Apple Silicon. CPU is the fallback everywhere.
     if device == "auto":
-        device = _autodetect_device()
-    if device == "cuda":
+        device = _autodetect_device("whisper")  # whisper-style: cuda > mps > cpu
+    if device in {"cuda", "mps"}:
         try:
             import torch  # type: ignore
-            pipeline.to(torch.device("cuda"))
-        except Exception:
-            pass
+            pipeline.to(torch.device(device))
+            if verbose:
+                print(f"  pyannote running on {device}", flush=True)
+        except Exception as e:
+            print(f"  pyannote: could not move to {device}, falling back to "
+                  f"cpu ({e})", flush=True)
 
     kwargs: dict = {}
     if num_speakers and num_speakers > 0:
@@ -524,11 +667,13 @@ def transcribe_one(
         return out_path
 
     env = env or load_env()
-    backend = backend or env.get("WHISPER_BACKEND") or DEFAULT_BACKEND
+    backend = backend or env.get("WHISPER_BACKEND") or "auto"
+    if backend == "auto":
+        backend = pick_default_backend()
     if backend not in DEFAULT_MODEL:
         raise SystemExit(
             f"unknown backend '{backend}'. "
-            f"choose from: {', '.join(DEFAULT_MODEL)}"
+            f"choose from: auto, {', '.join(DEFAULT_MODEL)}"
         )
     if model is None:
         model = env.get("WHISPER_MODEL") or DEFAULT_MODEL[backend]
@@ -551,6 +696,10 @@ def transcribe_one(
         if backend == "faster-whisper":
             words, meta = transcribe_faster_whisper(
                 audio, model, device, compute_type, language, verbose,
+            )
+        elif backend == "mlx":
+            words, meta = transcribe_mlx_whisper(
+                audio, model, language, verbose,
             )
         elif backend == "openai":
             words, meta = transcribe_openai_api(
@@ -619,7 +768,8 @@ def load_api_key() -> dict[str, str]:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Transcribe a video with Whisper "
-                    "(faster-whisper / openai / whisper) + optional pyannote diarization",
+                    "(faster-whisper / mlx / openai / whisper) "
+                    "+ optional pyannote diarization",
     )
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
@@ -630,25 +780,32 @@ def main() -> None:
     )
     ap.add_argument(
         "--backend",
-        choices=list(DEFAULT_MODEL.keys()),
+        choices=["auto"] + list(DEFAULT_MODEL.keys()),
         default=None,
-        help=f"Transcription backend (default: {DEFAULT_BACKEND}). "
-             "faster-whisper = local CTranslate2, fastest. "
+        help="Transcription backend. "
+             "auto (default) = mlx on Apple Silicon if installed, else faster-whisper. "
+             "faster-whisper = local CTranslate2, fast on CUDA + Intel CPU. "
+             "mlx = Apple MLX framework, native Apple Silicon path. "
              "openai = hosted Whisper API. "
-             "whisper = reference openai-whisper package.",
+             "whisper = reference openai-whisper package (supports MPS on Mac).",
     )
     ap.add_argument(
         "--model",
         type=str,
         default=None,
         help="Model name. faster-whisper/whisper: tiny|base|small|medium|"
-             "large-v2|large-v3 (default large-v3). openai: whisper-1.",
+             "large-v2|large-v3 (default large-v3). "
+             "mlx: a HuggingFace repo id or local path (default "
+             "mlx-community/whisper-large-v3-mlx). "
+             "openai: whisper-1.",
     )
     ap.add_argument(
         "--device",
         type=str,
         default=DEFAULT_DEVICE,
-        help="auto|cpu|cuda (auto-detects CUDA, falls back to CPU)",
+        help="auto|cpu|cuda|mps. faster-whisper supports cpu/cuda only. "
+             "openai-whisper and pyannote support mps on Apple Silicon. "
+             "mlx ignores this flag (always uses Apple GPU/ANE).",
     )
     ap.add_argument(
         "--compute-type",
@@ -693,7 +850,7 @@ def main() -> None:
     transcribe_one(
         video=video,
         edit_dir=edit_dir,
-        backend=args.backend or DEFAULT_BACKEND,
+        backend=args.backend or "auto",
         model=args.model,
         device=args.device,
         compute_type=args.compute_type,

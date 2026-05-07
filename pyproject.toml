@@ -15,16 +15,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Apple Silicon (M1/M2/M3/M4): native MLX backend. Massively faster than
+# faster-whisper-CPU on the same Mac. Install only on macOS arm64.
+mac = ["mlx-whisper>=0.4.0; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # Speaker diarization. Heavy (pulls torch); install only if you need it.
+# On Apple Silicon, torch will pick up MPS automatically.
 diarize = ["pyannote.audio>=3.1"]
 # Hosted Whisper backend (whisper-1 with word timestamps).
 openai = ["openai>=1.30"]
-# Original reference Whisper package (slower than faster-whisper, here for parity).
+# Original reference Whisper package (slower than faster-whisper, here for
+# parity; supports MPS on Apple Silicon when faster-whisper falls back to CPU).
 whisper = ["openai-whisper>=20231117"]
 # Animation engines.
 animations = ["manim"]
-# Convenience: everything optional in one shot.
+# Convenience: everything optional in one shot. The mlx-whisper line is
+# guarded by the same platform marker so this works on Linux/Windows too.
 all = [
+    "mlx-whisper>=0.4.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "pyannote.audio>=3.1",
     "openai>=1.30",
     "openai-whisper>=20231117",

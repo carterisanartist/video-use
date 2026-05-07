@@ -11,10 +11,12 @@ Drop raw footage in a folder, chat with your coding agent, get `final.mp4` back.
 ## What changed from upstream
 
 - **No ElevenLabs.** No `ELEVENLABS_API_KEY`. No per-minute billing.
-- **Default backend: [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)** — a CTranslate2 port of Whisper. Word-level timestamps via `word_timestamps=True`. Auto-detects CUDA, falls back to CPU.
-- **Optional speaker diarization** via [`pyannote.audio`](https://github.com/pyannote/pyannote-audio) — gated on a HuggingFace token. If you don't set one up, every word gets `speaker_0` and the rest of the pipeline keeps working.
+- **Cross-platform local transcription.** Default backend is [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) — a CTranslate2 port of Whisper with word-level timestamps. Auto-detects CUDA, falls back to CPU.
+- **First-class macOS / Apple Silicon path** via [`mlx-whisper`](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Apple's MLX framework runs Whisper natively on the M-series GPU + Neural Engine, ~3–5× faster than `faster-whisper-CPU` on the same Mac. The smart default automatically picks `mlx` on Apple Silicon when it's installed.
+- **Optional speaker diarization** via [`pyannote.audio`](https://github.com/pyannote/pyannote-audio) — gated on a HuggingFace token. Picks up CUDA on Linux/Windows or MPS on Apple Silicon automatically. If you don't set up a token, every word gets `speaker_0` and the rest of the pipeline keeps working.
 - **Optional cloud backend** (`--backend openai`) — uses OpenAI's hosted `whisper-1` with word timestamps. Useful when you have no GPU.
-- **Same Scribe-compatible JSON schema** — `pack_transcripts.py`, `timeline_view.py`, and `render.py` are bit-identical to upstream. Drop-in replacement.
+- **Optional MPS backend** (`--backend whisper --device mps`) — the reference openai-whisper package via PyTorch MPS. Slower than mlx but plays nicely with pyannote inside the same process.
+- **Same Scribe-compatible JSON schema** — `pack_transcripts.py`, `timeline_view.py`, and `render.py` are bit-identical to upstream. Drop-in replacement regardless of which backend you pick.
 - **Tradeoff:** Whisper does not detect Scribe-style audio events like `(laughter)` or `(applause)`. They were never load-bearing for cuts.
 
 ## What it does
@@ -34,7 +36,7 @@ Paste into Claude Code, Codex, Hermes, Openclaw, or any agent with shell access:
 ```text
 Set up https://github.com/carterisanartist/video-use for me.
 
-Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and confirm the default Whisper backend (faster-whisper) imports cleanly. No API keys are required for the default flow. If I tell you I want speaker diarization, walk me through the HuggingFace token setup. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
+Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and confirm the default Whisper backend imports cleanly. If I'm on Apple Silicon (M1/M2/M3/M4), also install the [mac] extra so mlx-whisper becomes the auto-picked fast path. No API keys are required for the default flow. If I tell you I want speaker diarization, walk me through the HuggingFace token setup. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
 
 The agent handles the clone, dependencies, skill registration, and (only if you ask) the optional HuggingFace token for diarization.
@@ -66,27 +68,37 @@ uv sync                         # or: pip install -e .
 brew install ffmpeg             # required (apt/pacman/winget on other OSes)
 brew install yt-dlp             # optional, for downloading online sources
 
-# 3. (Optional) Speaker diarization
+# 3. (Apple Silicon only) Install the native MLX backend for ~3-5x speedup
+pip install -e '.[mac]'
+# After this, transcribe.py auto-picks mlx-whisper without any extra flag.
+
+# 4. (Optional) Speaker diarization (works with MPS on Apple Silicon)
 pip install -e '.[diarize]'
 # Then accept https://huggingface.co/pyannote/speaker-diarization-3.1 and add:
 echo "HUGGINGFACE_TOKEN=hf_..." >> .env
 
-# 4. (Optional) Hosted backend
+# 5. (Optional) Hosted backend
 pip install -e '.[openai]'
 echo "OPENAI_API_KEY=sk-..." >> .env
 ```
 
-The first time `transcribe.py` runs, faster-whisper downloads the model weights to `~/.cache/huggingface/hub/`. `large-v3` is ~3 GB; `tiny` is ~150 MB.
+The first time `transcribe.py` runs, the chosen backend downloads model weights to `~/.cache/huggingface/hub/`. `large-v3` is ~3 GB; `tiny` is ~150 MB. MLX models live under `mlx-community/whisper-*-mlx`; everything else is the standard `openai/whisper-*` repos.
 
 ## Backend cheat sheet
 
-| Backend | Install | Speed (CPU) | Speed (CUDA) | Diarization | Cost |
+| Backend | Install | Best on | Speed | Diarization | Cost |
 |---|---|---|---|---|---|
-| `faster-whisper` (default) | included | ~1× realtime (`large-v3`) | ~10–20× | optional via pyannote | free |
-| `openai` (cloud) | `pip install -e '.[openai]'` | network-bound | network-bound | optional via pyannote | $0.006/min |
-| `whisper` (reference) | `pip install -e '.[whisper]'` | ~0.3× realtime (`large-v3`) | ~3–5× | optional via pyannote | free |
+| `faster-whisper` (default) | included | Linux/Windows + NVIDIA, Intel Mac | ~10–20× realtime (CUDA), ~1× (CPU) | optional via pyannote | free |
+| `mlx` (auto on Apple Silicon) | `pip install -e '.[mac]'` | Apple Silicon (M1/M2/M3/M4) | ~3–5× realtime (`large-v3` on M2 Pro) | optional via pyannote (MPS) | free |
+| `openai` (cloud) | `pip install -e '.[openai]'` | no local GPU | network-bound | optional via pyannote | $0.006/min |
+| `whisper` (reference) | `pip install -e '.[whisper]'` | parity / MPS fallback | ~0.3× realtime CPU, ~1–2× MPS, ~3–5× CUDA | optional via pyannote | free |
 
-Pick the model size with `--model tiny|base|small|medium|large-v2|large-v3`. `large-v3` is what you ship; `medium` is the reasonable speed/quality tradeoff on CPU; `tiny` is only for install smoke tests.
+Pick the model size with `--model tiny|base|small|medium|large-v2|large-v3`. For mlx use the matching `mlx-community/whisper-*-mlx` repo id. `large-v3` is what you ship; `medium` is the reasonable speed/quality tradeoff on CPU; `tiny` is only for install smoke tests.
+
+The smart default (`--backend auto`, which is what runs when you don't pass `--backend`):
+
+- Apple Silicon + `mlx-whisper` installed → `mlx`
+- everything else → `faster-whisper`
 
 ## How it works
 

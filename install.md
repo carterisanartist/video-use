@@ -48,19 +48,38 @@ command -v uv >/dev/null && uv sync || pip install -e .
 
 `pyproject.toml` lists `requests`, `librosa`, `matplotlib`, `pillow`, `numpy`, and `faster-whisper`. The first transcription will download the Whisper model weights (~3 GB for `large-v3`, ~150 MB for `tiny`) into the HuggingFace cache. No console scripts — helpers are invoked directly as `python helpers/<name>.py`.
 
-Optional extras:
+#### Apple Silicon (M1/M2/M3/M4) — recommended path
+
+`faster-whisper` runs on your Mac, but only on the CPU — CTranslate2 has no Metal backend yet. The native fast path on Apple Silicon is **`mlx-whisper`**, which uses the Apple GPU + Neural Engine via Apple's MLX framework. Roughly 3–5× faster than faster-whisper-CPU on the same Mac for `large-v3`.
+
+```bash
+pip install -e '.[mac]'        # installs mlx-whisper alongside the defaults
+```
+
+The skill auto-detects this: as soon as `mlx-whisper` is importable on Apple Silicon, `python helpers/transcribe.py <video>` (with no `--backend` flag) picks the `mlx` backend automatically. To force a different backend, pass `--backend faster-whisper` etc. To verify the auto-pick:
+
+```bash
+python -c "from transcribe import pick_default_backend; print(pick_default_backend())" -- # run from helpers/
+```
+
+Pre-converted MLX model weights live at <https://huggingface.co/mlx-community>; the default model `mlx-community/whisper-large-v3-mlx` downloads (~3 GB) into the HuggingFace cache on first use, same as upstream.
+
+#### Optional extras (all platforms)
 
 ```bash
 # Speaker diarization (pyannote.audio + torch) — heavy, only if needed.
+# torch will pick up CUDA on Linux/Windows or MPS on Apple Silicon automatically.
 pip install -e '.[diarize]'
 
 # Hosted OpenAI Whisper backend.
 pip install -e '.[openai]'
 
-# Reference openai-whisper package (slower than faster-whisper).
+# Reference openai-whisper package (supports MPS on Apple Silicon when
+# faster-whisper falls back to CPU; slower than mlx-whisper).
 pip install -e '.[whisper]'
 
-# All optional extras at once.
+# All optional extras at once. The mac-specific bit is platform-guarded
+# and is a no-op on Linux/Windows.
 pip install -e '.[all]'
 ```
 
@@ -111,7 +130,7 @@ If you can't tell which agent you're in, ask the user once: "which agent am I ru
 
 ### 5. Pick a Whisper backend (optional configuration)
 
-The default backend (`faster-whisper`) needs **no setup at all** — it runs locally and has no API key. You can stop here and the pipeline works.
+The default backend needs **no setup at all** — `faster-whisper` runs locally on Linux / Windows / Intel Mac, and `mlx-whisper` runs on Apple Silicon when you installed `[mac]`. Either way, no API key is required. You can stop here and the pipeline works.
 
 Three optional knobs you can offer the user:
 
@@ -143,18 +162,36 @@ Useful if the user has no local GPU and doesn't want to wait for CPU transcripti
 2. Add `OPENAI_API_KEY=…` to `.env` (key from <https://platform.openai.com/api-keys>).
 3. Run with `--backend openai`.
 
-#### c) GPU acceleration for `faster-whisper`
+#### c) GPU / accelerator selection
 
-If the machine has CUDA, `faster-whisper` auto-detects it. Force it explicitly with `--device cuda --compute-type float16`. On Apple Silicon, CPU with `int8` is the right default — there is no Metal backend in CTranslate2 yet.
+| Hardware | Best backend | Flags |
+|---|---|---|
+| Apple Silicon (M1/M2/M3/M4) | `mlx` (auto if installed) | `--backend mlx` to force; `--model mlx-community/whisper-large-v3-mlx` |
+| Apple Silicon, no MLX | `whisper` with MPS | `--backend whisper --device mps --model large-v3` |
+| NVIDIA GPU (Linux/Windows) | `faster-whisper` | `--device cuda --compute-type float16` (auto-detected) |
+| Intel Mac / CPU only | `faster-whisper` (default) | `--compute-type int8` (the default) |
+| No local GPU, network OK | `openai` | `--backend openai` |
 
 ### 6. Verify end-to-end
 
-Run one cheap thing to prove the pipeline is wired up:
+Run a few cheap checks to prove the pipeline is wired up:
 
 ```bash
-python ~/Developer/video-use-whisper/helpers/timeline_view.py --help >/dev/null && echo "helpers OK"
+cd ~/Developer/video-use-whisper
+
+python helpers/timeline_view.py --help >/dev/null && echo "helpers OK"
 python -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
 ffprobe -version | head -1
+
+# On Apple Silicon, also verify the MLX path:
+python -c "import platform, sys; \
+  assert sys.platform == 'darwin' and platform.machine() == 'arm64', 'not Apple Silicon'; \
+  import mlx_whisper; print('mlx-whisper OK')" 2>/dev/null || \
+  echo "  (mlx-whisper not installed; pip install -e '.[mac]' for the fast Apple Silicon path)"
+
+# Confirm which backend the smart-default would pick:
+python -c "import sys; sys.path.insert(0, 'helpers'); \
+  from transcribe import pick_default_backend; print('default backend ->', pick_default_backend())"
 ```
 
 A full transcription test is optional at install time — for `large-v3` it triggers a multi-GB model download. Better to wait until the user hands you their first clip; if they do, run with `--model tiny` for the very first run so the download is quick (~150 MB) and only swap up to `large-v3` once they care about quality.

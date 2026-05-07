@@ -45,6 +45,7 @@ from transcribe import (
     DEFAULT_DEVICE,
     DEFAULT_MODEL,
     load_env,
+    pick_default_backend,
     transcribe_one,
 )
 
@@ -63,6 +64,9 @@ def find_videos(videos_dir: Path) -> list[Path]:
 
 
 def _default_workers(backend: str) -> int:
+    """Network-bound backends benefit from concurrency. Local backends
+    (faster-whisper, mlx, whisper) load the model into RAM/VRAM/Apple GPU
+    per worker, so default to 1 to avoid OOM / contention."""
     return 4 if backend == "openai" else 1
 
 
@@ -85,9 +89,10 @@ def main() -> None:
     )
     ap.add_argument(
         "--backend",
-        choices=list(DEFAULT_MODEL.keys()),
+        choices=["auto"] + list(DEFAULT_MODEL.keys()),
         default=None,
-        help=f"Transcription backend (default: {DEFAULT_BACKEND}).",
+        help="Transcription backend (default: auto -> mlx on Apple Silicon "
+             "if installed, else faster-whisper).",
     )
     ap.add_argument(
         "--model",
@@ -147,13 +152,15 @@ def main() -> None:
         return
 
     env = load_env()
-    backend = args.backend or env.get("WHISPER_BACKEND") or DEFAULT_BACKEND
+    backend = args.backend or env.get("WHISPER_BACKEND") or "auto"
+    if backend == "auto":
+        backend = pick_default_backend()
     workers = args.workers if args.workers is not None else _default_workers(backend)
 
     print(f"transcribing {len(pending)} files with backend={backend}, workers={workers}")
     if backend != "openai" and workers > 1:
         print("  note: local backends load the model into memory per worker; "
-              "watch RAM/VRAM usage")
+              "watch RAM/VRAM/Apple-GPU usage")
 
     t0 = time.time()
     errors: list[tuple[Path, str]] = []
