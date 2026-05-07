@@ -109,16 +109,31 @@ def _sample_frame_stats(
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
         metadata_path = f.name
 
+    # Escape the metadata file path for ffmpeg's filter-argument parser.
+    # ffmpeg uses `:` as the separator between filter options, so
+    # `metadata=print:file=C:\Users\...` is parsed as three options where
+    # the third one is `\Users\...` -- which causes the entire signalstats
+    # pass to fail on Windows. The fix is to convert backslashes to forward
+    # slashes (ffmpeg accepts those on Windows) and escape the drive-letter
+    # colon. Result: `C\:/Users/Carter/AppData/Local/Temp/tmp...txt`.
+    safe_metadata_path = metadata_path.replace("\\", "/").replace(":", r"\:")
+
     try:
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-nostats",
             "-ss", f"{start:.3f}",
             "-i", str(video),
             "-t", f"{duration:.3f}",
-            "-vf", f"fps={fps:.2f},signalstats,metadata=print:file={metadata_path}",
+            "-vf", f"fps={fps:.2f},signalstats,metadata=print:file={safe_metadata_path}",
             "-f", "null", "-",
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture stderr so a real ffmpeg error surfaces in the caller's
+        # exception handler instead of getting swallowed by DEVNULL.
+        subprocess.run(
+            cmd, check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
 
         # Parse signalstats metadata. Signalstats reports values in the NATIVE
         # bit depth of the decoded frame (8-bit → 0-255, 10-bit → 0-1023). We
@@ -213,7 +228,21 @@ def auto_grade_for_clip(
         except Exception:
             duration = 10.0
 
-    stats = _sample_frame_stats(video, start, duration)
+    # If the stats sampling pass fails for any reason (Windows path-escape
+    # weirdness, codec quirk, permissions on the temp dir, etc.) fall back
+    # to the neutral baseline grade rather than crashing the entire render.
+    # The whole point of "auto" is that it's a quality-of-life upgrade --
+    # it should never be load-bearing.
+    try:
+        stats = _sample_frame_stats(video, start, duration)
+    except Exception as e:
+        if verbose:
+            print(f"  ! auto-grade stats failed ({type(e).__name__}: {e}); "
+                  f"using neutral baseline")
+        return get_preset("subtle"), {
+            "y_mean": 0.5, "y_std": 0.2, "sat_mean": 0.4,
+            "fallback": True,
+        }
 
     y_mean = stats["y_mean"]
     y_range = stats["y_std"] * 4.0  # back to range
