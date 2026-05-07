@@ -55,6 +55,89 @@ except Exception:
     auto_crop = None  # type: ignore[assignment]
 
 
+# ---------------------------------------------------------------------------
+# Resilience layer: structured ffmpeg errors + duration probe cache.
+#
+# Every ffmpeg invocation in this file goes through `_run_ffmpeg`, which
+# captures stderr (instead of letting it die in subprocess.PIPE) and
+# raises a typed `FfmpegError` carrying the last few stderr lines + the
+# full command. main() catches it and prints an actionable message that
+# points at `helpers/doctor.py --fix`, so the agent (or human) has a
+# concrete recovery path on every failure mode rather than a bare
+# CalledProcessError stack trace.
+# ---------------------------------------------------------------------------
+
+
+class FfmpegError(RuntimeError):
+    """ffmpeg returned a non-zero exit. Carries enough context for a
+    self-healing retry (or a clear human-readable message)."""
+
+    def __init__(self, label: str, cmd: list[str], stderr: str, returncode: int):
+        self.label = label
+        self.cmd = cmd
+        self.stderr = stderr or ""
+        self.returncode = returncode
+        super().__init__(f"{label}: ffmpeg exited {returncode}")
+
+    def tail(self, n: int = 12) -> str:
+        lines = [ln for ln in self.stderr.splitlines() if ln.strip()]
+        return "\n".join(lines[-n:])
+
+
+def _run_ffmpeg(
+    cmd: list[str],
+    label: str,
+    *,
+    capture_stdout: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run ffmpeg/ffprobe with stderr captured for diagnostics. On non-zero
+    exit raises FfmpegError with the tail of stderr."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=(subprocess.PIPE if capture_stdout else subprocess.DEVNULL),
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+    except FileNotFoundError as e:
+        raise FfmpegError(
+            label, cmd,
+            f"binary not found: {e}\n"
+            "Install ffmpeg or run: python helpers/doctor.py",
+            127,
+        )
+    if proc.returncode != 0:
+        raise FfmpegError(label, cmd, proc.stderr or "", proc.returncode)
+    return proc
+
+
+_DURATION_CACHE: dict[str, float] = {}
+
+
+def probe_duration(path: Path) -> float | None:
+    """Return source duration in seconds (cached). None if probe fails."""
+    key = str(path)
+    if key in _DURATION_CACHE:
+        return _DURATION_CACHE[key]
+    try:
+        proc = _run_ffmpeg(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            label=f"ffprobe:{path.name}",
+            capture_stdout=True,
+        )
+        dur = float((proc.stdout or "").strip())
+        _DURATION_CACHE[key] = dur
+        return dur
+    except Exception:
+        return None
+
+
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
 #
 # MarginV is NOT taste — it is a platform safe-zone rule.
@@ -399,6 +482,22 @@ def extract_segment(
     else:
         preset, crf = "fast", "20"
 
+    # Pre-flight clamp: if start+duration spills past the source, ffmpeg
+    # either silently truncates or fails depending on the build. Clamp
+    # explicitly so the segment is always in-bounds and the failure mode
+    # below is a real error, not a length surprise. Leaves a 50ms safety
+    # gap so the final fade-out has room.
+    src_dur = probe_duration(source)
+    if src_dur is not None:
+        max_dur = max(0.05, src_dur - seg_start - 0.05)
+        if duration > max_dur:
+            print(f"  ! clamping segment duration {duration:.3f}s -> "
+                  f"{max_dur:.3f}s (source ends at {src_dur:.3f}s)")
+            duration = max_dur
+            fade_out_start = max(0.0, duration - 0.03)
+            af = (f"afade=t=in:st=0:d=0.03,"
+                  f"afade=t=out:st={fade_out_start:.3f}:d=0.03")
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
@@ -412,7 +511,44 @@ def extract_segment(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _run_ffmpeg(cmd, label=f"extract:{out_path.name}")
+        return
+    except FfmpegError as e:
+        # Self-healing retry: drop the most-likely-to-break filter components
+        # and try once more with a more forgiving configuration. We only
+        # ever retry once — if this still fails, the caller surfaces the
+        # original stderr so doctor / a human can act on it.
+        err_text = e.stderr.lower()
+        retry_vf_parts: list[str] = []
+        if grade_filter:
+            # Skip the grade filter chain — it's the most likely place a
+            # raw user-supplied ffmpeg expression typoed.
+            retry_vf_parts.append(size_filter)
+        elif "tonemap" in err_text or "color" in err_text:
+            # HDR tonemap chain failed. Drop tonemap, keep size.
+            retry_vf_parts.append(size_filter)
+        else:
+            # Re-raise — there's nothing structural to back off from.
+            raise
+
+        retry_vf = ",".join(retry_vf_parts)
+        retry_cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", retry_vf,
+            "-af", af,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        print(f"  ! extract failed, retrying without grade/tonemap "
+              f"({out_path.name})")
+        _run_ffmpeg(retry_cmd, label=f"extract-retry:{out_path.name}")
 
 
 def _resolve_crop_mode(requested: str, fit: str) -> str:
@@ -559,7 +695,7 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
         encoding="utf-8",
     )
 
-    cmd = [
+    cmd_copy = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
@@ -567,8 +703,32 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"concat → {out_path.name}")
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    print(f"concat -> {out_path.name}")
+    try:
+        _run_ffmpeg(cmd_copy, label=f"concat:{out_path.name}")
+    except FfmpegError as e:
+        # `-c copy` requires every segment to share codec/timebase/etc.
+        # When extract_segment used different fallback parameters per
+        # segment (the retry path above), or when the user mixed in
+        # external clips, copy fails. Re-encoding always works.
+        print("  ! concat -c copy failed, falling back to re-encode "
+              "(slower but works on heterogeneous segments)")
+        cmd_reenc = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        try:
+            _run_ffmpeg(cmd_reenc, label=f"concat-reenc:{out_path.name}")
+        except FfmpegError as e2:
+            # Re-raise the second failure so the caller can surface the
+            # underlying issue. Keep the original error in the chain.
+            raise e2 from e
     concat_list.unlink(missing_ok=True)
 
 
@@ -742,8 +902,8 @@ def apply_loudnorm_two_pass(
             "-movflags", "+faststart",
             str(output_path),
         ]
-        print(f"  loudnorm (1-pass preview) → {output_path.name}")
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        print(f"  loudnorm (1-pass preview) -> {output_path.name}")
+        _run_ffmpeg(cmd, label=f"loudnorm:{output_path.name}")
         return True
 
     # Full two-pass
@@ -774,8 +934,8 @@ def apply_loudnorm_two_pass(
         "-movflags", "+faststart",
         str(output_path),
     ]
-    print(f"  loudnorm pass 2: normalizing → {output_path.name}")
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    print(f"  loudnorm pass 2: normalizing -> {output_path.name}")
+    _run_ffmpeg(cmd, label=f"loudnorm:{output_path.name}")
     return True
 
 
@@ -853,9 +1013,9 @@ def build_final_composite(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"compositing → {out_path.name}")
+    print(f"compositing -> {out_path.name}")
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _run_ffmpeg(cmd, label=f"composite:{out_path.name}")
 
 
 # -------- Main ---------------------------------------------------------------
@@ -1028,5 +1188,55 @@ def main() -> None:
     print(f"\ndone: {out_path} ({size_mb:.1f} MB)")
 
 
+def _print_failure_help(exc: BaseException, edl_path: Path | None) -> None:
+    """When something explodes mid-render, give the agent (or human) the
+    exact next command to run instead of a stack trace they have to read.
+    Doctor knows how to validate / auto-fix the most common causes:
+    BOM bytes in the EDL, out-of-range timestamps, missing subtitle/overlay
+    files, unknown aspect/fit values."""
+    print()
+    print("=" * 72)
+    print("RENDER FAILED")
+    print("=" * 72)
+    if isinstance(exc, FfmpegError):
+        print(f"  step  : {exc.label}")
+        print(f"  exit  : {exc.returncode}")
+        print(f"  cmd   : {' '.join(exc.cmd[:6])}{' ...' if len(exc.cmd) > 6 else ''}")
+        print()
+        print("  ffmpeg stderr (tail):")
+        for line in exc.tail().splitlines():
+            print(f"    {line}")
+    else:
+        print(f"  {type(exc).__name__}: {exc}")
+    print()
+    print("  next step: run the doctor and re-try.")
+    if edl_path is not None:
+        print(f"    python helpers/doctor.py --fix {edl_path}")
+    else:
+        print("    python helpers/doctor.py --fix")
+    print("=" * 72)
+
+
 if __name__ == "__main__":
-    main()
+    # Best-effort grab of the EDL path so the failure-help can suggest
+    # `doctor.py --fix <edl>`. We can't lean on argparse yet because main()
+    # is what owns it; sys.argv is the simplest reliable source.
+    _edl_for_help: Path | None = None
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        try:
+            _edl_for_help = Path(sys.argv[1]).resolve()
+        except Exception:
+            _edl_for_help = None
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n(aborted)")
+        sys.exit(130)
+    except FfmpegError as e:
+        _print_failure_help(e, _edl_for_help)
+        sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - intentional broad catch
+        _print_failure_help(e, _edl_for_help)
+        sys.exit(3)

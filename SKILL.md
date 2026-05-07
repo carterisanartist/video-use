@@ -31,6 +31,7 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use/` project directory.
+13. **When any helper crashes, run `python helpers/doctor.py --fix [edl.json]` once and re-try before bothering the user.** `render.py` already prints the exact command in its failure banner — copy it. Doctor strips JSON BOMs, clamps out-of-range EDL times, drops missing overlay/subtitle references, snaps fit-mode typos (`cover` → `crop`), reports missing source files, and surveys which Whisper backends + opencv are actually installed. Anything it can't auto-fix gets a `[FAIL]` line with the exact next step. If doctor says "all clear" and the helper still fails, then escalate to the user.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -108,6 +109,16 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, optional Whisper backend config). Don't re-run it every session; on cold start just verify:
 
+**Easy mode — let the doctor verify:**
+
+```bash
+python helpers/doctor.py
+```
+
+This is the canonical health check. It surveys Python version, ffmpeg + ffprobe + libass, every Whisper backend (faster-whisper / mlx / openai / openai-whisper), pyannote + HUGGINGFACE_TOKEN, opencv for dynamic crop, and any UTF-8 BOM contamination in the edit folder. Run it at session start and after any helper crash. Doctor is the source of truth — if it says "all clear", the env is fine.
+
+If you're verifying by hand instead:
+
 - The Whisper backend works. On Linux / Windows / Intel Mac the default `faster-whisper` needs no API key — `python -c "from faster_whisper import WhisperModel"` should import cleanly. On Apple Silicon (M1/M2/M3/M4), the smart default switches to `mlx-whisper` once `pip install -e '.[mac]'` has been run; verify with `python -c "import mlx_whisper"`. If you'll use the hosted backend, check `OPENAI_API_KEY` is set.
 - If the user wants speaker diarization, `HUGGINGFACE_TOKEN` resolves (in env or in `.env` at the repo root) and `pyannote.audio` is importable. If missing, diarization is silently skipped and every word gets `speaker_0` — call this out in the inventory phase if the take is multi-speaker.
 - `ffmpeg` + `ffprobe` on PATH.
@@ -119,6 +130,34 @@ First-time install lives in `install.md` (clone, deps, ffmpeg, skill registratio
 
 Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this SKILL.md. Resolve their paths relative to the directory containing this file — the skill is typically symlinked at `~/.claude/skills/video-use/` or `~/.codex/skills/video-use/`.
 
+## Self-healing (when something breaks)
+
+The package is designed to recover from the common failure modes without dragging the user in. The recovery loop is always the same — **don't deviate from it**:
+
+1. Helper crashes. `render.py` prints a `RENDER FAILED` banner with the ffmpeg stderr tail and the exact `doctor` command to run.
+2. Run `python helpers/doctor.py --fix [path/to/edl.json]` exactly as printed.
+3. Re-try the original command **once**.
+4. If it still fails: read doctor's `[FAIL]` lines, fix manually, escalate to the user only if the next step is genuinely ambiguous.
+
+What auto-fixes / auto-recovers without anyone touching anything:
+
+| Symptom                                                   | Where it's handled                  | Fix                                                                                  |
+| --------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ |
+| `UnicodeDecodeError` parsing an EDL with a BOM            | `render.py` reads with `utf-8-sig`  | already loaded; doctor `--fix` strips the BOM in place for cleanliness               |
+| EDL `range.end` past the source duration                  | `extract_segment` clamps before ffmpeg invoke | clamps to `source_dur - 0.05`, prints `! clamping segment duration ...`        |
+| Bad / typoed grade filter chain                           | `extract_segment` retry loop        | re-runs the segment without the grade, prints `! extract failed, retrying ...`       |
+| `concat -c copy` failing on heterogeneous segments        | `concat_segments` fallback          | re-encodes (`libx264`/`aac`) and continues, prints `! concat -c copy failed ...`     |
+| Subtitle / overlay file missing                           | doctor `--fix`                      | drops the dead reference (backup written), re-render works                           |
+| Unknown `output.fit` value (`cover`, `contain`, `fill`)   | doctor `--fix`                      | snaps to the canonical name (`crop`, `pad`, `scale`)                                 |
+| ffmpeg / ffprobe not on PATH                              | doctor diagnose                     | reports the install command for macOS / Ubuntu / Windows                             |
+| Whisper backend missing (`mlx-whisper` on Apple Silicon)  | doctor diagnose                     | reports the exact `pip install -e '.[mac\|crop\|diarize\|openai]'` extra to install  |
+| `--crop-mode subject\|track` requested without opencv     | `render.py` warning + fallback      | downgrades to `center` + prints the install hint                                     |
+| 0 faces detected in a segment                             | `auto_crop` fallback                | silently uses center crop for that segment only                                      |
+
+Everything that touches a user file (EDL, transcript JSON) is backed up as `<file>.bak` before the rewrite, so users can revert a bad auto-fix without git.
+
+**You may add new failure modes to this list as they appear.** The recovery flow is what stays evergreen; the table grows.
+
 ## Helpers
 
 - **`transcribe.py <video>`** — single-file Whisper call. Smart default backend: `mlx` on Apple Silicon when `mlx-whisper` is installed, otherwise `faster-whisper`. Override with `--backend faster-whisper|mlx|openai|whisper`. `--num-speakers N` is a hint to pyannote when diarization is enabled. `--no-diarize` skips diarization entirely. `--device mps` is valid for the `whisper` backend on Apple Silicon. Cached.
@@ -129,6 +168,7 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`auto_crop.py <video>`** — probe-only utility. Detects the per-source face track and dumps it to JSON. `render.py` calls this internally when `--crop-mode` is `subject` / `track` / `auto+opencv`; you usually don't run it by hand. Cached at `<edit>/face_tracks/<source>.json`.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 - **`wizard.py`** — interactive Python script that runs the same toddler-mode conversation outside the agent (for users without Cursor in front of them). Prints the exact `transcribe_batch` → hand-edit-EDL → `render.py` commands at the end. `--no-prompt` accepts all defaults for shell-driven use.
+- **`doctor.py [edl.json] [--fix]`** — self-healing preflight. Surveys env (Python / ffmpeg / libass), every Whisper backend, opencv, file hygiene (UTF-8 BOMs), and validates an EDL when given one (source paths, range bounds, fit/crop_mode values, subtitle/overlay refs). `--fix` auto-resolves everything safe (BOM-strip, clamp out-of-range times, drop missing refs, snap fit-mode typos) with `.bak` backups. **Run this on any helper crash before bothering the user.**
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 

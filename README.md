@@ -31,6 +31,7 @@ Drop raw footage in a folder, chat with your coding agent, get `final.mp4` back.
 - **Loudness-normalizes** to social-media standard (-14 LUFS / -1 dBTP / LRA 11) so the volume sounds right on every platform.
 - **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation.
 - **Self-evaluates the rendered output** at every cut boundary before showing you anything.
+- **Self-heals on failure.** Every helper that touches ffmpeg captures real stderr, auto-clamps out-of-range cut times before they crash, retries past bad grade filters, and falls back to re-encode when `-c copy` concat refuses heterogeneous segments. On any unrecoverable error, `render.py` prints the exact `python helpers/doctor.py --fix` command to run — doctor strips JSON BOMs, clamps EDL bounds, drops missing overlay/subtitle refs, snaps `fit` typos, and surveys every backend, with `.bak` backups before any rewrite. Designed so an agent picking this up cold can always fix itself once and re-try.
 - **Persists session memory** in `project.md` so next week's session picks up where you left off.
 
 ### Make a vertical 3-minute TikTok in one sentence
@@ -119,6 +120,13 @@ pip install -e '.[crop]'
 # Once installed, --crop-mode auto (the default) starts following the
 # speaker's face whenever you convert landscape sources to vertical.
 # Without this, crop falls back to a static center crop.
+
+# 7. Verify everything is wired up
+python helpers/doctor.py
+# Surveys Python / ffmpeg / libass, every Whisper backend, opencv,
+# pyannote + HUGGINGFACE_TOKEN. Run with --fix to auto-resolve common
+# issues (BOM bytes in JSON, out-of-range EDL cuts, missing overlay
+# refs, fit-mode typos like "cover" -> "crop").
 ```
 
 The first time `transcribe.py` runs, the chosen backend downloads model weights to `~/.cache/huggingface/hub/`. `large-v3` is ~3 GB; `tiny` is ~150 MB. MLX models live under `mlx-community/whisper-*-mlx`; everything else is the standard `openai/whisper-*` repos.
