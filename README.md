@@ -22,7 +22,8 @@ Drop raw footage in a folder, chat with your coding agent, get `final.mp4` back.
 ## What it does
 
 - **Talks to you like you're five.** One plain-English question at a time — "tall or wide?", "1 minute or 3?", "punchy or chill?" — never a checklist, never jargon. Say "just go" and it stops asking and starts cutting.
-- **Outputs vertical, horizontal, or square** with one flag. Built-in presets for `tiktok` / `reels` / `shorts` (1080×1920), `youtube` / `tv` (1920×1080), `square` / `instagram` (1080×1080), `4k`, plus arbitrary `WxH`. Fit modes: `crop` (no bars), `pad` (black bars), `blur` (TikTok-style blurred-copy background).
+- **Outputs vertical, horizontal, or square** with one flag. Built-in presets for `tiktok` / `reels` / `shorts` (1080×1920), `youtube` / `tv` (1920×1080), `square` / `instagram` (1080×1080), `4k`, plus arbitrary `WxH`. Fit modes: `crop` (no bars), `pad` (black bars), `blur` (TikTok-style blurred-copy background, `--blur-sigma N` for strength). One-shot platform bundles via `--platform tiktok|reels|shorts|youtube|youtube-shorts|instagram|instagram-feed|instagram-reels|x|twitter|linkedin`.
+- **Dynamic crop that follows the speaker.** Landscape → vertical doesn't chop the speaker out of frame. With `opencv-python-headless` installed, `--crop-mode auto` (the default) detects the face per source, smooths the trajectory zero-phase, and emits a per-segment ffmpeg crop expression that keeps the subject framed. `--crop-mode track` for full per-frame tracking on moving shots; `--crop-mode subject` for one-fixed-window-per-segment; `--crop-mode center` to disable. Detection is cached at `<edit>/face_tracks/<source>.json`.
 - **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes.
 - **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain).
 - **30ms audio fades** at every cut so you never hear a pop.
@@ -43,8 +44,23 @@ The agent confirms in one sentence ("OK — making a 3-minute tall video for Tik
 ### Or one-shot it from the CLI once you have an EDL
 
 ```bash
-python helpers/render.py edit/edl.json -o edit/final.mp4 --aspect tiktok --build-subtitles
+# vertical with subject-aware dynamic crop (default --crop-mode auto)
+python helpers/render.py edit/edl.json -o edit/final.mp4 --platform tiktok --build-subtitles
+
+# moving subjects, force per-frame tracking
+python helpers/render.py edit/edl.json -o edit/final.mp4 --platform tiktok --crop-mode track
+
+# vertical-into-horizontal with a soft blurred background instead of bars
+python helpers/render.py edit/edl.json -o edit/final.mp4 --platform youtube --fit blur --blur-sigma 32
 ```
+
+### Don't have an agent? Use the wizard
+
+```bash
+python helpers/wizard.py
+```
+
+Asks the same toddler-mode questions in your terminal (one A/B at a time), then prints the exact `transcribe_batch` → hand-edit-EDL → `render.py` commands to run. `--no-prompt` accepts all defaults for shell scripts.
 
 ## Setup prompt
 
@@ -97,6 +113,12 @@ echo "HUGGINGFACE_TOKEN=hf_..." >> .env
 # 5. (Optional) Hosted backend
 pip install -e '.[openai]'
 echo "OPENAI_API_KEY=sk-..." >> .env
+
+# 6. (Recommended for vertical) Subject-aware dynamic crop
+pip install -e '.[crop]'
+# Once installed, --crop-mode auto (the default) starts following the
+# speaker's face whenever you convert landscape sources to vertical.
+# Without this, crop falls back to a static center crop.
 ```
 
 The first time `transcribe.py` runs, the chosen backend downloads model weights to `~/.cache/huggingface/hub/`. `large-v3` is ~3 GB; `tiny` is ~150 MB. MLX models live under `mlx-community/whisper-*-mlx`; everything else is the standard `openai/whisper-*` repos.

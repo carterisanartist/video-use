@@ -46,6 +46,14 @@ except Exception:
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
 
+# Subject-aware cropping is fully optional. If opencv isn't installed,
+# auto_crop.has_opencv() returns False and crop_mode "auto" silently falls
+# back to "center", so importing the module never blocks the rest of render.py.
+try:
+    import auto_crop  # same directory
+except Exception:
+    auto_crop = None  # type: ignore[assignment]
+
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
 #
@@ -168,6 +176,36 @@ ASPECT_PRESETS: dict[str, tuple[int, int]] = {
 
 DEFAULT_ASPECT = "horizontal"
 DEFAULT_FIT = "crop"  # for portrait<->landscape conversions
+DEFAULT_BLUR_SIGMA = 24  # ffmpeg gblur sigma for fit=blur background
+
+# All four crop modes:
+#   - center  : classic centered window (no detection needed)
+#   - auto    : if opencv is installed and a face is found, behave as
+#               "subject"; otherwise fall back silently to "center"
+#   - subject : one fixed crop per segment, centered on the average face
+#               position within that segment
+#   - track   : true dynamic per-frame trajectory via piecewise-linear
+#               expressions in the ffmpeg crop filter's x= / y= args
+CROP_MODES = ("center", "auto", "subject", "track")
+DEFAULT_CROP_MODE = "auto"
+
+# Platform shortcuts. --platform NAME sets aspect + fit + crop_mode in
+# one go; explicit CLI flags still win. Built around the dominant
+# delivery formats; users can compose their own with --aspect / --fit /
+# --crop-mode if they need something else.
+PLATFORM_PRESETS: dict[str, dict[str, str]] = {
+    "tiktok":          {"aspect": "tiktok",     "fit": "crop", "crop_mode": "auto"},
+    "reels":           {"aspect": "reels",      "fit": "crop", "crop_mode": "auto"},
+    "shorts":          {"aspect": "shorts",     "fit": "crop", "crop_mode": "auto"},
+    "youtube-shorts":  {"aspect": "shorts",     "fit": "crop", "crop_mode": "auto"},
+    "instagram":       {"aspect": "square",     "fit": "crop", "crop_mode": "auto"},
+    "instagram-feed":  {"aspect": "square",     "fit": "crop", "crop_mode": "auto"},
+    "instagram-reels": {"aspect": "reels",      "fit": "crop", "crop_mode": "auto"},
+    "youtube":         {"aspect": "youtube",    "fit": "pad",  "crop_mode": "center"},
+    "linkedin":        {"aspect": "square",     "fit": "crop", "crop_mode": "auto"},
+    "x":               {"aspect": "horizontal", "fit": "pad",  "crop_mode": "center"},
+    "twitter":         {"aspect": "horizontal", "fit": "pad",  "crop_mode": "center"},
+}
 
 
 def parse_aspect(value: str | None) -> tuple[int, int]:
@@ -196,17 +234,25 @@ def parse_aspect(value: str | None) -> tuple[int, int]:
     )
 
 
-def build_size_filter(target_w: int, target_h: int, fit: str) -> str:
+def build_size_filter(
+    target_w: int,
+    target_h: int,
+    fit: str,
+    blur_sigma: float = DEFAULT_BLUR_SIGMA,
+) -> str:
     """Build a ffmpeg -vf chain that resizes input to exactly (target_w, target_h)
     using the chosen fit mode.
 
     Fit modes:
       - crop:  center-crop input to target aspect, then scale exactly. No black
-               bars, no distortion. Default for landscape <-> portrait.
+               bars, no distortion. Default for landscape <-> portrait. The
+               static center crop here is overridden by extract_segment when a
+               dynamic crop_mode is in use.
       - pad:   scale to fit inside the target box, fill the remainder with black.
                Loses no pixels but adds bars when source aspect != target aspect.
       - blur:  scale to fit inside, fill the remainder with a Gaussian-blurred
                copy of the source. The TikTok / Reels filler-bg style.
+               `blur_sigma` controls how blurry the background is (default 24).
       - scale: just stretch. Distorts; rarely wanted but available.
     """
     target_ar = target_w / target_h
@@ -232,11 +278,13 @@ def build_size_filter(target_w: int, target_h: int, fit: str) -> str:
     if fit == "blur":
         # split=2 inside -vf works in modern ffmpeg. Background gets scaled to
         # cover (force_original_aspect_ratio=increase + crop), gaussian blur,
-        # then the foreground (fit-inside) is overlaid on top.
+        # then the foreground (fit-inside) is overlaid on top. `blur_sigma`
+        # is the gblur strength — higher = softer / more dreamy.
+        sigma = max(0.1, float(blur_sigma))
         return (
             f"split=2[bg][fg];"
             f"[bg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={target_w}:{target_h},gblur=sigma=24[bgblur];"
+            f"crop={target_w}:{target_h},gblur=sigma={sigma:.2f}[bgblur];"
             f"[fg]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos[fgs];"
             f"[bgblur][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1"
         )
@@ -248,12 +296,16 @@ def resolve_output_size(
     edl: dict,
     cli_aspect: str | None,
     cli_fit: str | None,
-) -> tuple[int, int, str]:
-    """Resolve the final (width, height, fit) by precedence: CLI > EDL > defaults.
+    cli_crop_mode: str | None = None,
+    cli_blur_sigma: float | None = None,
+) -> tuple[int, int, str, str, float]:
+    """Resolve the final (width, height, fit, crop_mode, blur_sigma) by
+    precedence: CLI > EDL > defaults.
 
     EDL `output` block looks like:
         "output": {"width": 1080, "height": 1920, "fit": "crop"}
-        "output": {"aspect": "tiktok", "fit": "blur"}
+        "output": {"aspect": "tiktok", "fit": "blur", "blur_sigma": 32}
+        "output": {"aspect": "tiktok", "fit": "crop", "crop_mode": "track"}
     """
     edl_out = (edl.get("output") or {}) if isinstance(edl, dict) else {}
 
@@ -270,7 +322,17 @@ def resolve_output_size(
     if fit not in {"crop", "pad", "blur", "scale"}:
         raise ValueError(f"invalid fit '{fit}' (choose crop|pad|blur|scale)")
 
-    return w, h, fit
+    crop_mode = cli_crop_mode or edl_out.get("crop_mode") or DEFAULT_CROP_MODE
+    if crop_mode not in CROP_MODES:
+        raise ValueError(f"invalid crop_mode '{crop_mode}' "
+                         f"(choose {'|'.join(CROP_MODES)})")
+
+    if cli_blur_sigma is not None:
+        blur_sigma = float(cli_blur_sigma)
+    else:
+        blur_sigma = float(edl_out.get("blur_sigma", DEFAULT_BLUR_SIGMA))
+
+    return w, h, fit, crop_mode, blur_sigma
 
 
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
@@ -287,12 +349,19 @@ def extract_segment(
     target_width: int = 1920,
     target_height: int = 1080,
     fit: str = DEFAULT_FIT,
+    blur_sigma: float = DEFAULT_BLUR_SIGMA,
+    size_filter_override: str | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scales to (target_width,
     target_height) using the given fit mode, applies HDR tone-mapping when the
     source carries HLG/PQ transfer.
+
+    `size_filter_override`: when subject-aware crop is in use, the caller
+    pre-builds the crop+scale vf for this exact segment (with face-tracked
+    coordinates) and passes it here. We use it instead of the static
+    build_size_filter() output. None = use the default static filter.
 
     Quality ladder:
       - final (default): full target res, libx264 fast CRF 20
@@ -306,7 +375,10 @@ def extract_segment(
         target_width = max(2, (target_width // 2) - (target_width // 2) % 2)
         target_height = max(2, (target_height // 2) - (target_height // 2) % 2)
 
-    size_filter = build_size_filter(target_width, target_height, fit)
+    if size_filter_override:
+        size_filter = size_filter_override
+    else:
+        size_filter = build_size_filter(target_width, target_height, fit, blur_sigma)
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
@@ -343,6 +415,33 @@ def extract_segment(
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
+def _resolve_crop_mode(requested: str, fit: str) -> str:
+    """Translate 'auto' (and validate other values) into a concrete mode.
+
+    Subject-aware crop only makes sense when fit=crop — pad/blur/scale either
+    don't crop or paste the full frame onto a background, so subject tracking
+    is moot. For those, we collapse to "center" and let build_size_filter
+    handle layout. When fit=crop and OpenCV is unavailable, "auto" silently
+    becomes "center" so the pipeline still renders.
+    """
+    if requested not in CROP_MODES:
+        raise ValueError(f"unknown --crop-mode {requested!r} "
+                         f"(choose {'|'.join(CROP_MODES)})")
+    if fit != "crop":
+        return "center"
+    if requested == "auto":
+        if auto_crop is not None and auto_crop.has_opencv():
+            return "subject"
+        return "center"
+    if requested in ("subject", "track"):
+        if auto_crop is None or not auto_crop.has_opencv():
+            print(f"  warning: --crop-mode {requested} requested but opencv "
+                  f"is not installed; falling back to center crop. "
+                  f"Install with: pip install opencv-python-headless")
+            return "center"
+    return requested
+
+
 def extract_all_segments(
     edl: dict,
     edit_dir: Path,
@@ -351,12 +450,18 @@ def extract_all_segments(
     target_width: int = 1920,
     target_height: int = 1080,
     fit: str = DEFAULT_FIT,
+    crop_mode: str = DEFAULT_CROP_MODE,
+    blur_sigma: float = DEFAULT_BLUR_SIGMA,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
 
     Each segment is extracted at the target output dimensions so the
     downstream concat is uniform and -c copy works without re-encoding.
+
+    When crop_mode is "subject" or "track" (or "auto" + OpenCV available),
+    we run face detection once per source (cached) and replace the static
+    center-crop with a per-segment subject-aware crop expression.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
@@ -368,9 +473,29 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
 
+    effective_crop_mode = _resolve_crop_mode(crop_mode, fit)
+
+    # Pre-compute (and cache) per-source face tracks if we're going dynamic.
+    # Uses one detection pass per unique source, no matter how many segments
+    # reference it.
+    track_cache: dict[str, dict] = {}
+    if effective_crop_mode in ("subject", "track") and auto_crop is not None:
+        unique_srcs = {r["source"] for r in ranges}
+        for src_name in unique_srcs:
+            src_path = resolve_path(sources[src_name], edit_dir)
+            try:
+                track_cache[src_name] = auto_crop.get_or_compute_track(
+                    src_path, edit_dir, verbose=True,
+                )
+            except SystemExit as e:
+                print(f"  ! face detection failed for {src_name}: {e}")
+                effective_crop_mode = "center"
+                break
+
     seg_paths: list[Path] = []
+    crop_label = effective_crop_mode if fit == "crop" else "n/a"
     print(f"extracting {len(ranges)} segment(s) -> {clips_dir.name}/  "
-          f"({target_width}x{target_height}, fit={fit})")
+          f"({target_width}x{target_height}, fit={fit}, crop={crop_label})")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
@@ -386,14 +511,36 @@ def extract_all_segments(
         else:
             seg_filter = resolved
 
+        # Build a dynamic size filter for this segment if we have a track.
+        size_filter_override: str | None = None
+        if effective_crop_mode in ("subject", "track") and src_name in track_cache:
+            track = track_cache[src_name]
+            if effective_crop_mode == "subject":
+                size_filter_override = auto_crop.build_subject_crop_filter(
+                    track, start, end, target_width, target_height,
+                )
+            else:  # "track"
+                size_filter_override = auto_crop.build_dynamic_crop_filter(
+                    track, start, end, target_width, target_height,
+                )
+            if size_filter_override is None:
+                # No face in this segment — silent fallback to center crop.
+                pass
+
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        crop_marker = ""
+        if size_filter_override:
+            crop_marker = f"  [{effective_crop_mode}]"
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  "
+              f"({duration:5.2f}s)  {note}{crop_marker}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
         extract_segment(
             src_path, start, duration, seg_filter, out_path,
             preview=preview, draft=draft,
             target_width=target_width, target_height=target_height, fit=fit,
+            blur_sigma=blur_sigma,
+            size_filter_override=size_filter_override,
         )
         seg_paths.append(out_path)
 
@@ -763,7 +910,55 @@ def main() -> None:
              "bars, blur = blurred copy as background (TikTok-style), "
              "scale = stretch. Overrides the EDL `output.fit` field.",
     )
+    ap.add_argument(
+        "--crop-mode",
+        type=str,
+        choices=list(CROP_MODES),
+        default=None,
+        help="How to position the crop window when fit=crop. "
+             "center = static center-crop (no detection). "
+             "auto = follow the subject if opencv is installed and a face "
+             "is found (default), else center. "
+             "subject = one fixed crop per segment, centered on the average "
+             "face position in that segment. "
+             "track = full per-frame dynamic tracking (use for shots where "
+             "the subject actually moves). Ignored when fit != crop.",
+    )
+    ap.add_argument(
+        "--blur-sigma",
+        type=float,
+        default=DEFAULT_BLUR_SIGMA,
+        help=f"Gaussian blur sigma for fit=blur background. Higher = softer. "
+             f"Default {DEFAULT_BLUR_SIGMA}.",
+    )
+    ap.add_argument(
+        "--platform",
+        type=str,
+        choices=sorted(PLATFORM_PRESETS.keys()),
+        default=None,
+        help="One-shot platform preset that bundles --aspect, --fit and "
+             "--crop-mode. Explicit individual flags still win. "
+             "Choices: " + ", ".join(sorted(PLATFORM_PRESETS.keys())) + ".",
+    )
     args = ap.parse_args()
+
+    # Apply platform preset before resolving anything else, so individual
+    # flags layered on top can override the preset's choices.
+    if args.platform:
+        preset = PLATFORM_PRESETS[args.platform]
+        if args.aspect is None:
+            args.aspect = preset["aspect"]
+        if args.fit is None:
+            args.fit = preset["fit"]
+        if args.crop_mode is None:
+            args.crop_mode = preset["crop_mode"]
+        print(f"platform preset '{args.platform}': aspect={preset['aspect']}, "
+              f"fit={preset['fit']}, crop-mode={preset['crop_mode']}")
+
+    # crop_mode and blur_sigma resolution: CLI > EDL > default. We pass
+    # None when the user didn't set the CLI flag so the EDL value can win.
+    cli_crop_mode = args.crop_mode  # may be None
+    cli_blur_sigma = args.blur_sigma if args.blur_sigma != DEFAULT_BLUR_SIGMA else None
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -775,14 +970,23 @@ def main() -> None:
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
 
-    target_w, target_h, fit = resolve_output_size(edl, args.aspect, args.fit)
-    print(f"output: {target_w}x{target_h} (fit={fit})")
+    target_w, target_h, fit, crop_mode, blur_sigma = resolve_output_size(
+        edl, args.aspect, args.fit, cli_crop_mode, cli_blur_sigma,
+    )
+    extras = []
+    if fit == "crop":
+        extras.append(f"crop-mode={crop_mode}")
+    if fit == "blur":
+        extras.append(f"blur-sigma={blur_sigma:g}")
+    extras_str = (", " + ", ".join(extras)) if extras else ""
+    print(f"output: {target_w}x{target_h} (fit={fit}{extras_str})")
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
         edl, edit_dir,
         preview=args.preview, draft=args.draft,
         target_width=target_w, target_height=target_h, fit=fit,
+        crop_mode=crop_mode, blur_sigma=blur_sigma,
     )
 
     # 2. Concat → base

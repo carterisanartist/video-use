@@ -26,6 +26,9 @@ openai = ["openai>=1.30"]
 # Original reference Whisper package (slower than faster-whisper, here for
 # parity; supports MPS on Apple Silicon when faster-whisper falls back to CPU).
 whisper = ["openai-whisper>=20231117"]
+# Subject-aware dynamic crop (face-tracking for vertical conversion).
+# Headless build because we never need to open a GUI window. ~70 MB install.
+crop = ["opencv-python-headless>=4.8"]
 # Animation engines.
 animations = ["manim"]
 # Convenience: everything optional in one shot. The mlx-whisper line is
@@ -35,6 +38,7 @@ all = [
     "pyannote.audio>=3.1",
     "openai>=1.30",
     "openai-whisper>=20231117",
+    "opencv-python-headless>=4.8",
     "manim",
 ]
 

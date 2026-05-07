@@ -125,8 +125,10 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 - **`transcribe_batch.py <videos_dir>`** — parallel batch transcription. Default workers: 1 for local backends (model lives in RAM / VRAM / Apple GPU per worker), 4 for the hosted `openai` backend.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
+- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--platform NAME` is a one-shot bundle of `--aspect/--fit/--crop-mode` for `tiktok|reels|shorts|youtube|youtube-shorts|instagram|instagram-feed|instagram-reels|x|twitter|linkedin`. `--crop-mode auto|center|subject|track` controls dynamic cropping (see "Dynamic crop" below). `--blur-sigma N` controls the background blur strength when `--fit blur` (default 24).
+- **`auto_crop.py <video>`** — probe-only utility. Detects the per-source face track and dumps it to JSON. `render.py` calls this internally when `--crop-mode` is `subject` / `track` / `auto+opencv`; you usually don't run it by hand. Cached at `<edit>/face_tracks/<source>.json`.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`wizard.py`** — interactive Python script that runs the same toddler-mode conversation outside the agent (for users without Cursor in front of them). Prints the exact `transcribe_batch` → hand-edit-EDL → `render.py` commands at the end. `--no-prompt` accepts all defaults for shell-driven use.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
@@ -345,13 +347,45 @@ python helpers/render.py edl.json -o final.mp4 --aspect 1440x1800
 # - crop (default): center-crop, no bars, faces stay framed
 # - pad:           scale to fit, fill with black bars
 # - blur:          scale to fit, fill with a blurred copy of the source (TikTok-style)
-python helpers/render.py edl.json -o final.mp4 --aspect tiktok --fit blur
+python helpers/render.py edl.json -o final.mp4 --aspect tiktok --fit blur --blur-sigma 24
+
+# One-shot platform preset (sets aspect + fit + crop-mode in one go).
+# Individual flags (--aspect/--fit/--crop-mode) layered on top still win.
+python helpers/render.py edl.json -o final.mp4 --platform tiktok
+python helpers/render.py edl.json -o final.mp4 --platform youtube
+python helpers/render.py edl.json -o final.mp4 --platform instagram-reels
 ```
 
 Or bake the choice into the EDL itself so renders are reproducible:
 
 ```json
 "output": {"aspect": "tiktok", "fit": "crop"}
+```
+
+### Dynamic crop (subject-aware)
+
+When you go landscape → vertical, a static center-crop will silently chop the speaker out of frame the moment they're not centered. `render.py --crop-mode` solves this:
+
+| mode      | what it does                                                                                                            | when to use                                                          |
+| --------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `center`  | classic centered window, no detection                                                                                   | source already framed for the target aspect                          |
+| `auto`    | uses `subject` if `opencv-python(-headless)` is installed and a face is found, otherwise `center` — **the default**     | you don't know in advance whether the source has a face              |
+| `subject` | one fixed crop per segment, centered on the **average** face position in that segment                                   | talking-head shots where the speaker barely moves within a cut       |
+| `track`   | true per-frame trajectory via piecewise-linear ffmpeg crop expressions, zero-phase-smoothed across the segment          | walking shots, panning sources, anything where the subject moves     |
+
+Subject-aware crop only fires when `--fit crop` (pad/blur/scale don't crop). Detection uses OpenCV's bundled Haar cascades — no model download, no API key, no network. Per-source face tracks are cached at `<edit>/face_tracks/<source>.json` so repeated renders re-use the detection.
+
+Install once: `pip install -e .[crop]` (or `opencv-python-headless` directly). Without it, `auto` silently degrades to `center`; `subject` / `track` print a one-line warning and fall back to `center`.
+
+```bash
+# default — auto-picks subject if opencv is installed
+python helpers/render.py edl.json -o final.mp4 --platform tiktok
+
+# force per-frame tracking for moving-subject shots
+python helpers/render.py edl.json -o final.mp4 --platform tiktok --crop-mode track
+
+# disable, in case detection misfires on weird footage
+python helpers/render.py edl.json -o final.mp4 --platform tiktok --crop-mode center
 ```
 
 The 24/30 fps choice is set inside `extract_segment` (`-r 24` is the current default — change it for explicitly screen-recorded sources where 30 reads cleaner).
@@ -366,7 +400,7 @@ The 24/30 fps choice is set inside `extract_segment` (`-r 24` is the current def
 {
   "version": 1,
   "sources": {"C0103": "/abs/path/C0103.MP4", "C0108": "/abs/path/C0108.MP4"},
-  "output": {"aspect": "tiktok", "fit": "crop"},
+  "output": {"aspect": "tiktok", "fit": "crop", "crop_mode": "auto"},
   "ranges": [
     {"source": "C0103", "start": 2.42, "end": 6.85,
      "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
@@ -384,6 +418,8 @@ The 24/30 fps choice is set inside `extract_segment` (`-r 24` is the current def
 
 - `output.aspect` is a preset name (`tiktok` / `reels` / `shorts` / `vertical` for 9:16, `youtube` / `horizontal` / `tv` for 16:9, `square` / `instagram` for 1:1, `4k` for 3840×2160) or an explicit `WxH` like `1080x1920`. You can also pass `output.width` + `output.height` directly. CLI `--aspect` overrides the EDL.
 - `output.fit` is `crop` (default — center-crop, no bars), `pad` (scale + black bars), `blur` (scale + blurred-copy background, TikTok-style), or `scale` (stretch).
+- `output.crop_mode` is `auto` (default — subject-aware if opencv is installed) / `center` / `subject` / `track`. See "Dynamic crop" above. Only meaningful when `output.fit == "crop"`. CLI `--crop-mode` overrides the EDL.
+- `output.blur_sigma` (number, default 24) is the Gaussian blur strength for `fit: "blur"`. CLI `--blur-sigma` overrides.
 - `grade` is a preset name or raw ffmpeg filter.
 - `overlays` are rendered animation clips.
 - `subtitles` is optional and applied LAST.
