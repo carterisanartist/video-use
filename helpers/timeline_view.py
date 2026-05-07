@@ -30,6 +30,15 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# Force UTF-8 stdio so unicode prints don't crash the script on Windows
+# where the default locale is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 # -------- Frame extraction ---------------------------------------------------
 
@@ -118,7 +127,7 @@ def compute_envelope(video: Path, start: float, end: float, samples: int = 2000)
 def words_in_range(transcript_path: Path, start: float, end: float) -> list[dict]:
     if not transcript_path.exists():
         return []
-    data = json.loads(transcript_path.read_text())
+    data = json.loads(transcript_path.read_text(encoding="utf-8"))
     out: list[dict] = []
     for w in data.get("words", []):
         t = w.get("type", "word")

@@ -34,6 +34,15 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Force UTF-8 stdio so unicode prints don't crash the script on Windows
+# where the default locale is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 PRESETS: dict[str, str] = {
     # Subtle baseline — barely perceptible cleanup. No color shift.

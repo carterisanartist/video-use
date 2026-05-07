@@ -28,6 +28,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Force UTF-8 stdio so unicode prints don't crash the script on Windows
+# where the default locale is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 try:
     from grade import get_preset, auto_grade_for_clip  # same directory
 except Exception:
@@ -251,7 +260,10 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
     """Lossless concat via the concat demuxer. No re-encode."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     concat_list = edit_dir / "_concat.txt"
-    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
+    concat_list.write_text(
+        "".join(f"file '{p.resolve()}'\n" for p in segment_paths),
+        encoding="utf-8",
+    )
 
     cmd = [
         "ffmpeg", "-y",
@@ -320,7 +332,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             seg_offset += seg_duration
             continue
 
-        transcript = json.loads(tr_path.read_text())
+        transcript = json.loads(tr_path.read_text(encoding="utf-8"))
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
         # Group into 2-word chunks, break on punctuation
@@ -363,7 +375,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
         lines.append(t)
         lines.append("")
-    out_path.write_text("\n".join(lines))
+    out_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"master SRT → {out_path.name} ({len(entries)} cues)")
 
 
@@ -590,7 +602,7 @@ def main() -> None:
     if not edl_path.exists():
         sys.exit(f"edl not found: {edl_path}")
 
-    edl = json.loads(edl_path.read_text())
+    edl = json.loads(edl_path.read_text(encoding="utf-8"))
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
 

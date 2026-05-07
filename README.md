@@ -1,12 +1,21 @@
 <p align="center">
-  <img src="static/video-use-banner.png" alt="video-use" width="100%">
+  <img src="static/video-use-banner.png" alt="video-use-whisper" width="100%">
 </p>
 
-# video-use
+# video-use-whisper
 
-Introducing **video-use** — edit videos with Claude Code. 100% open source.
+A fork of [browser-use/video-use](https://github.com/browser-use/video-use) that swaps ElevenLabs Scribe for **local Whisper** transcription. Same conversation-driven editing pipeline, no API key, runs on your laptop.
 
-Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works for any content — talking heads, montages, tutorials, travel, interviews — without presets or menus.
+Drop raw footage in a folder, chat with your coding agent, get `final.mp4` back. Works for any content — talking heads, montages, tutorials, travel, interviews — without presets or menus.
+
+## What changed from upstream
+
+- **No ElevenLabs.** No `ELEVENLABS_API_KEY`. No per-minute billing.
+- **Default backend: [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)** — a CTranslate2 port of Whisper. Word-level timestamps via `word_timestamps=True`. Auto-detects CUDA, falls back to CPU.
+- **Optional speaker diarization** via [`pyannote.audio`](https://github.com/pyannote/pyannote-audio) — gated on a HuggingFace token. If you don't set one up, every word gets `speaker_0` and the rest of the pipeline keeps working.
+- **Optional cloud backend** (`--backend openai`) — uses OpenAI's hosted `whisper-1` with word timestamps. Useful when you have no GPU.
+- **Same Scribe-compatible JSON schema** — `pack_transcripts.py`, `timeline_view.py`, and `render.py` are bit-identical to upstream. Drop-in replacement.
+- **Tradeoff:** Whisper does not detect Scribe-style audio events like `(laughter)` or `(applause)`. They were never load-bearing for cuts.
 
 ## What it does
 
@@ -23,12 +32,12 @@ Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works
 Paste into Claude Code, Codex, Hermes, Openclaw, or any agent with shell access:
 
 ```text
-Set up https://github.com/browser-use/video-use for me.
+Set up https://github.com/carterisanartist/video-use for me.
 
-Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and set up the ElevenLabs API key — ask me to paste it when you need it. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
+Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and confirm the default Whisper backend (faster-whisper) imports cleanly. No API keys are required for the default flow. If I tell you I want speaker diarization, walk me through the HuggingFace token setup. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
 
-The agent handles the clone, dependencies, skill registration, and prompts you once for your ElevenLabs API key (grab one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)).
+The agent handles the clone, dependencies, skill registration, and (only if you ask) the optional HuggingFace token for diarization.
 
 Then point your agent at a folder of raw takes:
 
@@ -45,24 +54,39 @@ It inventories the sources, proposes a strategy, waits for your OK, then produce
 
 ## Manual install
 
-If you'd rather do it by hand:
-
 ```bash
 # 1. Clone and symlink into your agent's skills directory
-git clone https://github.com/browser-use/video-use ~/Developer/video-use
-ln -sfn ~/Developer/video-use ~/.claude/skills/video-use        # Claude Code
-# ln -sfn ~/Developer/video-use ~/.codex/skills/video-use       # Codex
+git clone https://github.com/carterisanartist/video-use ~/Developer/video-use-whisper
+ln -sfn ~/Developer/video-use-whisper ~/.claude/skills/video-use        # Claude Code
+# ln -sfn ~/Developer/video-use-whisper ~/.codex/skills/video-use       # Codex
 
 # 2. Install deps
-cd ~/Developer/video-use
+cd ~/Developer/video-use-whisper
 uv sync                         # or: pip install -e .
-brew install ffmpeg             # required
+brew install ffmpeg             # required (apt/pacman/winget on other OSes)
 brew install yt-dlp             # optional, for downloading online sources
 
-# 3. Add your ElevenLabs API key
-cp .env.example .env
-$EDITOR .env                    # ELEVENLABS_API_KEY=...
+# 3. (Optional) Speaker diarization
+pip install -e '.[diarize]'
+# Then accept https://huggingface.co/pyannote/speaker-diarization-3.1 and add:
+echo "HUGGINGFACE_TOKEN=hf_..." >> .env
+
+# 4. (Optional) Hosted backend
+pip install -e '.[openai]'
+echo "OPENAI_API_KEY=sk-..." >> .env
 ```
+
+The first time `transcribe.py` runs, faster-whisper downloads the model weights to `~/.cache/huggingface/hub/`. `large-v3` is ~3 GB; `tiny` is ~150 MB.
+
+## Backend cheat sheet
+
+| Backend | Install | Speed (CPU) | Speed (CUDA) | Diarization | Cost |
+|---|---|---|---|---|---|
+| `faster-whisper` (default) | included | ~1× realtime (`large-v3`) | ~10–20× | optional via pyannote | free |
+| `openai` (cloud) | `pip install -e '.[openai]'` | network-bound | network-bound | optional via pyannote | $0.006/min |
+| `whisper` (reference) | `pip install -e '.[whisper]'` | ~0.3× realtime (`large-v3`) | ~3–5× | optional via pyannote | free |
+
+Pick the model size with `--model tiny|base|small|medium|large-v2|large-v3`. `large-v3` is what you ship; `medium` is the reasonable speed/quality tradeoff on CPU; `tiny` is only for install smoke tests.
 
 ## How it works
 
@@ -72,7 +96,7 @@ The LLM never watches the video. It **reads** it — through two layers that tog
   <img src="static/timeline-view.svg" alt="timeline_view composite — filmstrip + speaker track + waveform + word labels + silence-gap cut candidates" width="100%">
 </p>
 
-**Layer 1 — Audio transcript (always loaded).** One ElevenLabs Scribe call per source gives word-level timestamps, speaker diarization, and audio events (`(laughter)`, `(applause)`, `(sigh)`). All takes pack into a single ~12KB `takes_packed.md` — the LLM's primary reading view.
+**Layer 1 — Audio transcript (always loaded).** One Whisper call per source gives word-level timestamps. With pyannote enabled, you also get speaker diarization. All takes pack into a single ~12KB `takes_packed.md` — the LLM's primary reading view.
 
 ```
 ## C0103  (duration: 43.0s, 8 phrases)
@@ -90,9 +114,9 @@ Same idea as browser-use giving an LLM a structured DOM instead of a screenshot 
 ## Pipeline
 
 ```
-Transcribe ──> Pack ──> LLM Reasons ──> EDL ──> Render ──> Self-Eval
-                                                              │
-                                                              └─ issue? fix + re-render (max 3)
+Transcribe (Whisper) ──> Pack ──> LLM Reasons ──> EDL ──> Render ──> Self-Eval
+                                                                       │
+                                                                       └─ issue? fix + re-render (max 3)
 ```
 
 The self-eval loop runs `timeline_view` on the _rendered output_ at every cut boundary — catches visual jumps, audio pops, hidden subtitles. You see the preview only after it passes.
@@ -104,5 +128,10 @@ The self-eval loop runs `timeline_view` on the _rendered output_ at every cut bo
 3. **Ask → confirm → execute → self-eval → persist.** Never touch the cut without strategy approval.
 4. **Zero assumptions about content type.** Look, ask, then edit.
 5. **12 hard rules, artistic freedom elsewhere.** Production-correctness is non-negotiable. Taste isn't.
+6. **Local first.** Default backend has no API key, no network round-trip, no per-minute cost.
 
 See [`SKILL.md`](./SKILL.md) for the full production rules and editing craft.
+
+## Credits
+
+Original `video-use` by [browser-use](https://github.com/browser-use/video-use). This fork swaps the transcription backend; the rest of the architecture, helpers, and SKILL.md craft are theirs. Whisper is from [OpenAI](https://github.com/openai/whisper); the fast local runtime is [SYSTRAN/faster-whisper](https://github.com/SYSTRAN/faster-whisper); diarization is [pyannote/pyannote-audio](https://github.com/pyannote/pyannote-audio).

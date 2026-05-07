@@ -1,9 +1,9 @@
-"""Pack all Scribe transcripts in <edit>/transcripts/ into one readable markdown.
+"""Pack all Whisper transcripts in <edit>/transcripts/ into one readable markdown.
 
 Groups word-level entries into phrase-level lines, breaking on any silence
 >= 0.5s OR speaker change. Each phrase gets a [start-end] prefix. This is
 the PRIMARY artifact the editor sub-agent reads to pick cuts — it fits one
-hour of takes in a tenth the tokens of raw Scribe JSON and gives
+hour of takes in a tenth the tokens of raw transcript JSON and gives
 word-boundary precision from text alone.
 
 Output: <edit>/takes_packed.md
@@ -19,6 +19,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+# Force UTF-8 stdio so unicode prints (->, >=, em-dash, …) don't crash the
+# script on Windows where the default locale is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def format_time(seconds: float) -> str:
@@ -39,12 +48,15 @@ def group_into_phrases(
     words: list[dict],
     silence_threshold: float = 0.5,
 ) -> list[dict]:
-    """Walk a Scribe word list, break into phrases on silence >= threshold
-    OR speaker change. Returns list of {start, end, text, speaker_id}.
+    """Walk a Whisper-formatted word list, break into phrases on silence
+    >= threshold OR speaker change. Returns list of {start, end, text,
+    speaker_id}.
 
-    Scribe `words` entries have types 'word', 'spacing', or 'audio_event'.
-    We keep 'word' and 'audio_event' content in phrase text. 'spacing'
-    entries carry the silence information via their start/end times.
+    Word entries have types 'word', 'spacing', or 'audio_event' (Whisper
+    backends do not emit audio_event — that was Scribe-only and is the
+    documented tradeoff for going local). We keep 'word' and 'audio_event'
+    content in phrase text. 'spacing' entries carry the silence information
+    via their start/end times.
     """
     phrases: list[dict] = []
     current_words: list[dict] = []
@@ -124,7 +136,7 @@ def group_into_phrases(
 
 def pack_one_file(json_path: Path, silence_threshold: float) -> tuple[str, float, list[dict]]:
     """Return (header_name, duration, phrases) for one transcript file."""
-    data = json.loads(json_path.read_text())
+    data = json.loads(json_path.read_text(encoding="utf-8"))
     words = data.get("words", [])
     phrases = group_into_phrases(words, silence_threshold)
     if phrases:
@@ -150,7 +162,8 @@ def render_markdown(entries: list[tuple[str, float, list[dict]]], silence_thresh
         for p in phrases:
             spk = p.get("speaker_id")
             if spk is not None:
-                # Scribe returns IDs like "speaker_0" — strip the prefix for readability
+                # Whisper diarization (and Scribe) returns IDs like "speaker_0";
+                # strip the prefix for readability.
                 spk_str = str(spk)
                 if spk_str.startswith("speaker_"):
                     spk_str = spk_str[len("speaker_"):]
@@ -163,7 +176,7 @@ def render_markdown(entries: list[tuple[str, float, list[dict]]], silence_thresh
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Pack Scribe transcripts into takes_packed.md")
+    ap = argparse.ArgumentParser(description="Pack Whisper transcripts into takes_packed.md")
     ap.add_argument("--edit-dir", type=Path, required=True, help="Edit directory containing transcripts/")
     ap.add_argument(
         "--silence-threshold",
@@ -192,7 +205,7 @@ def main() -> None:
     markdown = render_markdown(entries, args.silence_threshold)
 
     out_path = args.output or (edit_dir / "takes_packed.md")
-    out_path.write_text(markdown)
+    out_path.write_text(markdown, encoding="utf-8")
 
     total_phrases = sum(len(e[2]) for e in entries)
     total_duration = sum(e[1] for e in entries)

@@ -1,7 +1,7 @@
 [project]
-name = "video-use"
-version = "0.1.0"
-description = "Conversation-driven video editor skill for Claude Code"
+name = "video-use-whisper"
+version = "0.2.0"
+description = "Conversation-driven video editor skill (Whisper fork of video-use)"
 requires-python = ">=3.10"
 dependencies = [
     "requests",
@@ -9,10 +9,27 @@ dependencies = [
     "matplotlib",
     "pillow",
     "numpy",
+    # Default local transcription backend. Pure CPython wheels for CTranslate2,
+    # no compiler needed. CUDA picked up automatically if installed.
+    "faster-whisper>=1.0.3",
 ]
 
 [project.optional-dependencies]
+# Speaker diarization. Heavy (pulls torch); install only if you need it.
+diarize = ["pyannote.audio>=3.1"]
+# Hosted Whisper backend (whisper-1 with word timestamps).
+openai = ["openai>=1.30"]
+# Original reference Whisper package (slower than faster-whisper, here for parity).
+whisper = ["openai-whisper>=20231117"]
+# Animation engines.
 animations = ["manim"]
+# Convenience: everything optional in one shot.
+all = [
+    "pyannote.audio>=3.1",
+    "openai>=1.30",
+    "openai-whisper>=20231117",
+    "manim",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
