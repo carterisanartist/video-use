@@ -140,6 +140,139 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
+# -------- Aspect / output-size presets --------------------------------------
+#
+# Output dimensions and fit behavior are first-class. The renderer reads them
+# from the EDL `output` field (preferred) or from --aspect / --fit on the CLI.
+# Subtitles work on every aspect because libass MarginV is in PlayResY units
+# and scales by ratio.
+
+ASPECT_PRESETS: dict[str, tuple[int, int]] = {
+    # Vertical / short-form social. All three platforms use 1080x1920 9:16.
+    "vertical":  (1080, 1920),
+    "tiktok":    (1080, 1920),
+    "reels":     (1080, 1920),
+    "shorts":    (1080, 1920),
+    # Horizontal / widescreen. The legacy default.
+    "horizontal": (1920, 1080),
+    "youtube":    (1920, 1080),
+    "tv":         (1920, 1080),
+    "1080p":      (1920, 1080),
+    # Square (Instagram feed, X video).
+    "square":     (1080, 1080),
+    "instagram":  (1080, 1080),
+    # 4K cinema.
+    "4k":         (3840, 2160),
+    "uhd":        (3840, 2160),
+}
+
+DEFAULT_ASPECT = "horizontal"
+DEFAULT_FIT = "crop"  # for portrait<->landscape conversions
+
+
+def parse_aspect(value: str | None) -> tuple[int, int]:
+    """Resolve an --aspect string to (width, height).
+
+    Accepts a preset name or an explicit "WxH" / "W,H" / "W:H" form.
+    """
+    if not value:
+        value = DEFAULT_ASPECT
+    v = value.strip().lower()
+    if v in ASPECT_PRESETS:
+        return ASPECT_PRESETS[v]
+    for sep in ("x", ":", ","):
+        if sep in v:
+            try:
+                w_str, h_str = v.split(sep, 1)
+                w, h = int(w_str), int(h_str)
+                if w <= 0 or h <= 0:
+                    raise ValueError
+                return w, h
+            except ValueError:
+                break
+    raise ValueError(
+        f"invalid --aspect '{value}'. Use a preset "
+        f"({', '.join(sorted(set(ASPECT_PRESETS)))}) or WxH like 1080x1920."
+    )
+
+
+def build_size_filter(target_w: int, target_h: int, fit: str) -> str:
+    """Build a ffmpeg -vf chain that resizes input to exactly (target_w, target_h)
+    using the chosen fit mode.
+
+    Fit modes:
+      - crop:  center-crop input to target aspect, then scale exactly. No black
+               bars, no distortion. Default for landscape <-> portrait.
+      - pad:   scale to fit inside the target box, fill the remainder with black.
+               Loses no pixels but adds bars when source aspect != target aspect.
+      - blur:  scale to fit inside, fill the remainder with a Gaussian-blurred
+               copy of the source. The TikTok / Reels filler-bg style.
+      - scale: just stretch. Distorts; rarely wanted but available.
+    """
+    target_ar = target_w / target_h
+
+    if fit == "scale":
+        return f"scale={target_w}:{target_h}"
+
+    if fit == "crop":
+        # iw / ih are input width/height. Pick the larger inner box that fits
+        # the target aspect, center-crop to it, then scale.
+        return (
+            f"crop='if(gt(iw/ih,{target_ar:.6f}),ih*{target_ar:.6f},iw)'"
+            f":'if(gt(iw/ih,{target_ar:.6f}),ih,iw/{target_ar:.6f})',"
+            f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
+        )
+
+    if fit == "pad":
+        return (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        )
+
+    if fit == "blur":
+        # split=2 inside -vf works in modern ffmpeg. Background gets scaled to
+        # cover (force_original_aspect_ratio=increase + crop), gaussian blur,
+        # then the foreground (fit-inside) is overlaid on top.
+        return (
+            f"split=2[bg][fg];"
+            f"[bg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={target_w}:{target_h},gblur=sigma=24[bgblur];"
+            f"[fg]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos[fgs];"
+            f"[bgblur][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1"
+        )
+
+    raise ValueError(f"unknown fit mode: {fit!r} (choose crop|pad|blur|scale)")
+
+
+def resolve_output_size(
+    edl: dict,
+    cli_aspect: str | None,
+    cli_fit: str | None,
+) -> tuple[int, int, str]:
+    """Resolve the final (width, height, fit) by precedence: CLI > EDL > defaults.
+
+    EDL `output` block looks like:
+        "output": {"width": 1080, "height": 1920, "fit": "crop"}
+        "output": {"aspect": "tiktok", "fit": "blur"}
+    """
+    edl_out = (edl.get("output") or {}) if isinstance(edl, dict) else {}
+
+    if cli_aspect:
+        w, h = parse_aspect(cli_aspect)
+    elif "width" in edl_out and "height" in edl_out:
+        w, h = int(edl_out["width"]), int(edl_out["height"])
+    elif "aspect" in edl_out:
+        w, h = parse_aspect(str(edl_out["aspect"]))
+    else:
+        w, h = parse_aspect(DEFAULT_ASPECT)
+
+    fit = cli_fit or edl_out.get("fit") or DEFAULT_FIT
+    if fit not in {"crop", "pad", "blur", "scale"}:
+        raise ValueError(f"invalid fit '{fit}' (choose crop|pad|blur|scale)")
+
+    return w, h, fit
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
 
 
@@ -151,27 +284,34 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    target_width: int = 1920,
+    target_height: int = 1080,
+    fit: str = DEFAULT_FIT,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
-    `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
+    `-ss` before `-i` for fast accurate seeking. Scales to (target_width,
+    target_height) using the given fit mode, applies HDR tone-mapping when the
+    source carries HLG/PQ transfer.
 
     Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
-      - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
-      - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+      - final (default): full target res, libx264 fast CRF 20
+      - preview:         full target res, libx264 medium CRF 22
+      - draft:           half-target res, libx264 ultrafast CRF 28 (cut-point check)
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Draft mode halves both dimensions while preserving aspect (snap to even).
     if draft:
-        scale = "scale=1280:-2"
-    else:
-        scale = "scale=1920:-2"
+        target_width = max(2, (target_width // 2) - (target_width // 2) % 2)
+        target_height = max(2, (target_height // 2) - (target_height // 2) % 2)
+
+    size_filter = build_size_filter(target_width, target_height, fit)
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
         vf_parts.append(TONEMAP_CHAIN)
-    vf_parts.append(scale)
+    vf_parts.append(size_filter)
     if grade_filter:
         vf_parts.append(grade_filter)
     vf = ",".join(vf_parts)
@@ -208,13 +348,15 @@ def extract_all_segments(
     edit_dir: Path,
     preview: bool,
     draft: bool = False,
+    target_width: int = 1920,
+    target_height: int = 1080,
+    fit: str = DEFAULT_FIT,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
 
-    If the EDL `grade` is "auto", analyze each segment range with
-    `auto_grade_for_clip` and apply a per-segment subtle correction.
-    Otherwise, apply the same preset/raw filter to every segment.
+    Each segment is extracted at the target output dimensions so the
+    downstream concat is uniform and -c copy works without re-encoding.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
@@ -227,7 +369,8 @@ def extract_all_segments(
     sources = edl["sources"]
 
     seg_paths: list[Path] = []
-    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
+    print(f"extracting {len(ranges)} segment(s) -> {clips_dir.name}/  "
+          f"({target_width}x{target_height}, fit={fit})")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
@@ -247,7 +390,11 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft,
+            target_width=target_width, target_height=target_height, fit=fit,
+        )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -332,7 +479,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             seg_offset += seg_duration
             continue
 
-        transcript = json.loads(tr_path.read_text(encoding="utf-8"))
+        transcript = json.loads(tr_path.read_text(encoding="utf-8-sig"))
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
         # Group into 2-word chunks, break on punctuation
@@ -596,19 +743,46 @@ def main() -> None:
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
     )
+    ap.add_argument(
+        "--aspect",
+        type=str,
+        default=None,
+        help="Output dimensions. Preset name "
+             "(vertical|tiktok|reels|shorts | horizontal|youtube|tv|1080p | "
+             "square|instagram | 4k|uhd) or explicit WxH like 1080x1920. "
+             "Overrides the EDL `output` block. Default: horizontal "
+             "(1920x1080) unless the EDL says otherwise.",
+    )
+    ap.add_argument(
+        "--fit",
+        type=str,
+        choices=["crop", "pad", "blur", "scale"],
+        default=None,
+        help="How to fit source frames into the target aspect when they "
+             "differ. crop = center-crop (no bars, default), pad = black "
+             "bars, blur = blurred copy as background (TikTok-style), "
+             "scale = stretch. Overrides the EDL `output.fit` field.",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
         sys.exit(f"edl not found: {edl_path}")
 
-    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    # utf-8-sig tolerates both BOM-ed (Notepad, some VSCode setups) and
+    # plain UTF-8 EDL files. Hand-authored EDLs often arrive with a BOM.
+    edl = json.loads(edl_path.read_text(encoding="utf-8-sig"))
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
 
+    target_w, target_h, fit = resolve_output_size(edl, args.aspect, args.fit)
+    print(f"output: {target_w}x{target_h} (fit={fit})")
+
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft
+        edl, edit_dir,
+        preview=args.preview, draft=args.draft,
+        target_width=target_w, target_height=target_h, fit=fit,
     )
 
     # 2. Concat → base

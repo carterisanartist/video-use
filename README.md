@@ -21,13 +21,30 @@ Drop raw footage in a folder, chat with your coding agent, get `final.mp4` back.
 
 ## What it does
 
-- **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes
-- **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain)
-- **30ms audio fades** at every cut so you never hear a pop
-- **Burns subtitles** in your style — 2-word UPPERCASE chunks by default, fully customizable
-- **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation
-- **Self-evaluates the rendered output** at every cut boundary before showing you anything
-- **Persists session memory** in `project.md` so next week's session picks up where you left off
+- **Talks to you like you're five.** One plain-English question at a time — "tall or wide?", "1 minute or 3?", "punchy or chill?" — never a checklist, never jargon. Say "just go" and it stops asking and starts cutting.
+- **Outputs vertical, horizontal, or square** with one flag. Built-in presets for `tiktok` / `reels` / `shorts` (1080×1920), `youtube` / `tv` (1920×1080), `square` / `instagram` (1080×1080), `4k`, plus arbitrary `WxH`. Fit modes: `crop` (no bars), `pad` (black bars), `blur` (TikTok-style blurred-copy background).
+- **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes.
+- **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain).
+- **30ms audio fades** at every cut so you never hear a pop.
+- **Burns subtitles** in your style — 2-word UPPERCASE chunks by default, MarginV that clears the TikTok / Reels / Shorts safe zones automatically, fully customizable.
+- **Loudness-normalizes** to social-media standard (-14 LUFS / -1 dBTP / LRA 11) so the volume sounds right on every platform.
+- **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation.
+- **Self-evaluates the rendered output** at every cut boundary before showing you anything.
+- **Persists session memory** in `project.md` so next week's session picks up where you left off.
+
+### Make a vertical 3-minute TikTok in one sentence
+
+```
+edit these into a tall 3-minute TikTok, cut the umms, big captions
+```
+
+The agent confirms in one sentence ("OK — making a 3-minute tall video for TikTok, cutting umms, big captions, no music. Yes?"), waits for "go", then produces `edit/final.mp4` at 1080×1920.
+
+### Or one-shot it from the CLI once you have an EDL
+
+```bash
+python helpers/render.py edit/edl.json -o edit/final.mp4 --aspect tiktok --build-subtitles
+```
 
 ## Setup prompt
 

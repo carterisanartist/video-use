@@ -34,6 +34,55 @@ These are the things where deviation produces silent failures or broken output. 
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
+## Toddler mode (default conversation style)
+
+The user is busy and does not speak video editor jargon. Talk to them like they are five.
+
+**Rules of the conversation:**
+
+1. **One question at a time.** Never present a wall of options. Ask, wait for the answer, then ask the next thing.
+2. **Plain English. Zero jargon.** Don't say "aspect ratio", say "tall (TikTok) or wide (YouTube)". Don't say "EDL", say "the cut list". Don't say "color grade", say "make the picture look nicer". Don't say "loudness normalization", say "make the volume right for social media".
+3. **A/B options whenever possible.** "Tall or wide?", "Fast or chill?", "1 minute or 3 minutes?". If the right answer needs three options, max three. Never offer four.
+4. **No checkboxes, no menus, no big bulleted lists.** Conversation only.
+5. **Show, don't ask, when you can.** If `ffprobe` already tells you the source is iPhone vertical, don't ask the aspect — propose vertical and ask "sound right?".
+6. **Recap once, then commit.** After you have enough answers, summarize in ONE sentence: "OK — I'm gonna make a 3-minute tall video for TikTok, cut the umms, big captions, no music." Then wait for "yes" / "go" / "do it" before touching the cut.
+7. **If they say "just go" or "you decide" at any point, stop asking and start cutting.** Make sensible defaults. Recap what you picked at the end so they can correct.
+
+**Starter question menu** — pick the ones the source material doesn't already answer for you. Always ask in this rough order, one per turn:
+
+> Should this be **tall** (TikTok / Reels / Shorts) or **wide** (YouTube / TV)?
+>
+> How long? **30 seconds**, **1 minute**, or **3 minutes**?
+>
+> **Punchy and fast** or **slow and chill**?
+>
+> Should I cut out the **umms** and pauses automatically? (yes / no)
+>
+> Should I burn in **big captions**? (yes / no)
+>
+> Anything I **must keep** no matter what? (one specific moment, or "nope")
+>
+> Anything I **must cut**? (a flub, an aside, or "nope")
+
+Skip any question whose answer is obvious from the footage. If they only have one source clip, don't ask "which take is your favorite". If the source is already 9:16, don't ask "tall or wide".
+
+**Forbidden phrases in toddler mode** — these are the kind of words that lose normal humans:
+
+| Don't say | Say instead |
+|---|---|
+| aspect ratio | tall or wide |
+| EDL / cut list / decision list | the list of clips I'll keep |
+| color grade | make the picture look nicer |
+| diarization | who's talking |
+| word-level timestamps | I know exactly when each word starts |
+| filler tokens | umms and uhs |
+| loudness normalization | volume that works on social |
+| force_style | how the captions look |
+| compositing | putting it all together |
+| EDL output_time offset | when each line shows up |
+
+If you genuinely need a technical term to be precise, define it inline the first time. Then drop it.
+
 ## Directory layout
 
 The skill lives in `video-use/`. User footage lives wherever they put it. All session outputs go into `<videos_dir>/edit/`.
@@ -85,7 +134,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
 2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
+3. **Converse — in toddler mode.** Describe what you see in plain English. Ask **one** question at a time, A/B options, no jargon (see the Toddler-mode section above for the question menu and forbidden phrases). Collect, in this rough order, only the things the source material doesn't already tell you: tall vs. wide, target length, fast vs. chill, cut umms or not, big captions or not, must-keep moments, must-cut moments, animations, grade. Skip every question whose answer is obvious. Stop asking and start cutting the moment they say "just go".
 4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
 5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
 6. **Preview.** `render.py --preview`.
@@ -139,9 +188,12 @@ INPUTS:
   - Speaker(s): <name, role, delivery style note>
   - Expected structure: <pick an archetype or invent one>
   - Verbal slips to avoid: <list from the pre-scan pass>
-  - Target runtime: <seconds>
+  - Target runtime: <seconds>   (e.g. 60 for short Reel, 180 for full TikTok cap)
+  - Output aspect: <horizontal|vertical|square>   (affects pacing — vertical short-form
+    favors faster cuts, hookier opens, and tighter ends than longform horizontal)
 
 Common structural archetypes (pick, adapt, or invent):
+  - Vertical short-form:  HOOK (≤2s) → PAYOFF → BEATS → CTA   (TikTok / Reels / Shorts)
   - Tech launch / demo:   HOOK → PROBLEM → SOLUTION → BENEFIT → EXAMPLE → CTA
   - Tutorial:             INTRO → SETUP → STEPS → GOTCHAS → RECAP
   - Interview:            (QUESTION → ANSWER → FOLLOWUP) repeat
@@ -152,10 +204,12 @@ Common structural archetypes (pick, adapt, or invent):
 
 RULES:
   - Start/end times must fall on word boundaries from the transcript.
-  - Pad cut boundaries (working window 30–200ms).
+  - Pad cut boundaries (working window 30–200ms; tighter for vertical short-form).
   - Prefer silences ≥ 400ms as cut targets.
   - Unavoidable slips are kept if no better take exists. Note them in "reason".
   - If over budget, revise: drop a beat or trim tails. Report total and self-correct.
+  - For vertical short-form: front-load the hook in ≤ 2s, never let any single
+    shot run more than ~6s without a beat change, and end on a clear button.
 
 OUTPUT (JSON array, no prose):
   [{"source": "C0103", "start": 2.42, "end": 6.85, "beat": "HOOK",
@@ -268,7 +322,43 @@ One sub-agent = one file (unique filenames, parallel agents don't overwrite each
 
 ## Output spec
 
-Match the source unless the user asked for something specific. Common targets: `1920×1080@24` cinematic, `1920×1080@30` screen content, `1080×1920@30` vertical social, `3840×2160@24` 4K cinema, `1080×1080@30` square. `render.py` defaults the scale to 1080p from any source; pass `--filter` or edit the extract command for other targets. Worth asking the user which delivery format matters.
+Pick the output dimensions from the conversation, not from a default. The most common asks fall into one of three buckets:
+
+- **Tall / vertical (TikTok, Reels, Shorts)** — `1080×1920` 9:16. Default for short-form social. The 3-minute mark is the modern TikTok cap and is what most "make me a TikTok" requests boil down to.
+- **Wide / horizontal (YouTube, websites, TV)** — `1920×1080` 16:9. Default for explainers, demos, talking-head longform.
+- **Square (Instagram feed, X video)** — `1080×1080`.
+
+`render.py` exposes this via `--aspect` and `--fit`:
+
+```bash
+# Tall / TikTok / Reels / Shorts (3-min default cap is enforced by the EDL,
+# not by render.py; render.py just produces whatever length the EDL specifies).
+python helpers/render.py edl.json -o final.mp4 --aspect tiktok
+
+# Wide / YouTube
+python helpers/render.py edl.json -o final.mp4 --aspect youtube
+
+# Custom dimensions
+python helpers/render.py edl.json -o final.mp4 --aspect 1440x1800
+
+# Fit modes when the source aspect doesn't match the target:
+# - crop (default): center-crop, no bars, faces stay framed
+# - pad:           scale to fit, fill with black bars
+# - blur:          scale to fit, fill with a blurred copy of the source (TikTok-style)
+python helpers/render.py edl.json -o final.mp4 --aspect tiktok --fit blur
+```
+
+Or bake the choice into the EDL itself so renders are reproducible:
+
+```json
+"output": {"aspect": "tiktok", "fit": "crop"}
+```
+
+The 24/30 fps choice is set inside `extract_segment` (`-r 24` is the current default — change it for explicitly screen-recorded sources where 30 reads cleaner).
+
+**Subtitle margin scales automatically.** libass `MarginV` is in PlayResY ratio units, so the same `MarginV=90` setting clears the safe zone on `1920×1080`, `1080×1920`, and `1080×1080`. No special-casing needed.
+
+**Tall + 3 minutes is the dominant short-form ask.** Default to `--aspect tiktok` when the user says "TikTok / Reels / Shorts / IG / vertical / for my phone" without further detail. Default the editor sub-agent's `Target runtime` to 180s when they say "3 minutes" — and always keep at least 5 seconds of room so the loudnorm + composite pass doesn't push you past the platform cap.
 
 ## EDL format
 
@@ -276,6 +366,7 @@ Match the source unless the user asked for something specific. Common targets: `
 {
   "version": 1,
   "sources": {"C0103": "/abs/path/C0103.MP4", "C0108": "/abs/path/C0108.MP4"},
+  "output": {"aspect": "tiktok", "fit": "crop"},
   "ranges": [
     {"source": "C0103", "start": 2.42, "end": 6.85,
      "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
@@ -291,7 +382,12 @@ Match the source unless the user asked for something specific. Common targets: `
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+- `output.aspect` is a preset name (`tiktok` / `reels` / `shorts` / `vertical` for 9:16, `youtube` / `horizontal` / `tv` for 16:9, `square` / `instagram` for 1:1, `4k` for 3840×2160) or an explicit `WxH` like `1080x1920`. You can also pass `output.width` + `output.height` directly. CLI `--aspect` overrides the EDL.
+- `output.fit` is `crop` (default — center-crop, no bars), `pad` (scale + black bars), `blur` (scale + blurred-copy background, TikTok-style), or `scale` (stretch).
+- `grade` is a preset name or raw ffmpeg filter.
+- `overlays` are rendered animation clips.
+- `subtitles` is optional and applied LAST.
+- `total_duration_s` is informational; the renderer trusts the per-segment timestamps.
 
 ## Memory — `project.md`
 
